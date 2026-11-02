@@ -122,3 +122,16 @@ Each entry should be a concise, human-readable description with a link to the PR
 ```markdown
 - Description of the change ([#123](https://github.com/grafana/mcp-grafana/pull/123))
 ```
+
+
+## Maintained fork images
+
+This fork keeps upstream release tags on their original commits and carries its
+patches on main. Product versions and image tags retain the upstream version.
+After the reviewed source passes CI, dispatch the Docker workflow on the merged
+commit with that upstream version. It publishes Debian and Alpine images to
+GHCR for Linux amd64 and arm64, with source revision labels and attestations.
+Branch and pull-request runs build images without publishing them.
+
+Before reusing an existing image version, verify its source revision. Do not
+replace a version consumed by a deployment without deployment authorization.

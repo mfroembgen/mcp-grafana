@@ -2,187 +2,94 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches:
-      - main
-    tags:
-      - "v*.*.*"
+    branches: [main]
   pull_request:
-    branches:
-      - main
-  release:
-    types: [published]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream release version to publish
+        required: true
+        default: "2.1.1"
 
 permissions:
   contents: read
 
 jobs:
   prepare:
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
-      is_tag: ${{ steps.check.outputs.is_tag }}
-      version: ${{ steps.tag.outputs.version }}
-      is_stable: ${{ steps.tag.outputs.is_stable }}
-      platforms: ${{ steps.platforms.outputs.platforms }}
+      version: ${{ steps.release.outputs.version }}
+      platforms: ${{ steps.release.outputs.platforms }}
+      repository: ${{ steps.release.outputs.repository }}
     steps:
-      - name: Check if tag push
-        id: check
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: release
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "is_tag=true" >> $GITHUB_OUTPUT
+          version=${REQUESTED_VERSION:-$(git describe --tags --match 'v[0-9]*' --abbrev=0)}
+          version=${version#v}
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git merge-base --is-ancestor "v$version" HEAD
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "repository=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
           else
-            echo "is_tag=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Process tag name
-        id: tag
-        if: steps.check.outputs.is_tag == 'true'
-        run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          # Check if this is a stable release (no rc, alpha, beta, etc.)
-          if [[ ! "$VERSION" =~ (rc|alpha|beta|pre|dev) ]]; then
-            echo "is_stable=true" >> $GITHUB_OUTPUT
-          else
-            echo "is_stable=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Determine platforms
-        id: platforms
-        run: |
-          # Only build multi-arch on pushes/tags/releases, not on PRs
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "platforms=linux/amd64" >> $GITHUB_OUTPUT
-          else
-            echo "platforms=linux/amd64,linux/arm64" >> $GITHUB_OUTPUT
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
           fi
 
   docker:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
     needs: prepare
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
-
-      - name: Build and Push to GAR (mirrored to Docker Hub)
-        uses: grafana/shared-workflows/actions/docker-build-push-image@210fd8662ec62738ab1ae6d890ef3ffed5a77a86 # docker-build-push-image/v0.3.5
-        id: build
-        with:
-          context: .
-          file: ./Dockerfile
-          # Keep GAR credentials for the signing steps below.
-          gar-delete-credentials-file: "false"
-          registries: gar
-          gar-environment: prod
-          gar-repository: dockerhub-mcp-grafana-prod-mirror
-          platforms: ${{ needs.prepare.outputs.platforms }}
-          build-args: |
-            VERSION=${{ needs.prepare.outputs.version }}
-          tags: |
-            ${{ needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.is_stable == 'true' && 'latest' || '' }}
-            ${{ needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.version || '' }}
-          push: ${{ needs.prepare.outputs.is_tag == 'true' }}
-
-      - name: Sign image and attest SBOMs
-        if: needs.prepare.outputs.is_tag == 'true'
-        uses: ./.github/actions/sign-image
-        with:
-          images: ${{ steps.build.outputs.images }}
-          digest: ${{ steps.build.outputs.digest }}
-          platforms: ${{ needs.prepare.outputs.platforms }}
-
-      - name: Delete Google Application Credentials file
-        if: always() && env.GOOGLE_APPLICATION_CREDENTIALS != ''
-        run: rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
-
-  docker-alpine:
     runs-on: ubuntu-latest
-    needs: prepare
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
-
-      - name: Build and Push Alpine to GAR (mirrored to Docker Hub)
-        uses: grafana/shared-workflows/actions/docker-build-push-image@210fd8662ec62738ab1ae6d890ef3ffed5a77a86 # docker-build-push-image/v0.3.5
-        id: build
-        with:
-          context: .
-          file: ./Dockerfile.alpine
-          # Keep GAR credentials for the signing steps below.
-          gar-delete-credentials-file: "false"
-          registries: gar
-          gar-environment: prod
-          gar-repository: dockerhub-mcp-grafana-prod-mirror
-          platforms: ${{ needs.prepare.outputs.platforms }}
-          build-args: |
-            VERSION=${{ needs.prepare.outputs.version }}
-          tags: |
-            ${{ needs.prepare.outputs.is_tag == 'true' && needs.prepare.outputs.is_stable == 'true' && 'alpine' || '' }}
-            ${{ needs.prepare.outputs.is_tag == 'true' && format('{0}-alpine', needs.prepare.outputs.version) || '' }}
-          push: ${{ needs.prepare.outputs.is_tag == 'true' }}
-
-      - name: Sign image and attest SBOMs
-        if: needs.prepare.outputs.is_tag == 'true'
-        uses: ./.github/actions/sign-image
-        with:
-          images: ${{ steps.build.outputs.images }}
-          digest: ${{ steps.build.outputs.digest }}
-          platforms: ${{ needs.prepare.outputs.platforms }}
-
-      - name: Delete Google Application Credentials file
-        if: always() && env.GOOGLE_APPLICATION_CREDENTIALS != ''
-        run: rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
-
-  mcp-registry:
-    runs-on: ubuntu-latest
-    needs: docker
-    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
-      id-token: write
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: docker
+            file: Dockerfile
+            suffix: ""
+            alias: latest
+          - name: docker-alpine
+            file: Dockerfile.alpine
+            suffix: -alpine
+            alias: alpine
     steps:
-      - name: Checkout code
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          fetch-depth: 0
-
-      - name: Extract version from tag
-        id: version
-        run: |
-          # Get the tag from the triggering workflow
-          TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
-          if [ -z "$TAG" ]; then
-            echo "No tag found at HEAD"
-            exit 1
-          fi
-          echo "VERSION=$TAG" >> $GITHUB_OUTPUT
-
-      - name: Extract image tag from version
-        id: image-tag
-        run: |
-          # Extract the image tag from the version
-          VERSION="${{ steps.version.outputs.VERSION }}"
-          echo "IMAGE_TAG=${VERSION#v}" >> $GITHUB_OUTPUT
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y jq
-          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
-          chmod +x mcp-publisher
-          sudo mv mcp-publisher /usr/local/bin/
-
-      - name: Update server.json with Docker image
-        run: |
-          # Update the server.json with the correct Docker image reference
-          # (note the image tag does not include the "v" prefix)
-          jq --arg version "${{ steps.version.outputs.VERSION }}" \
-            --arg image "docker.io/grafana/mcp-grafana:${{ steps.image-tag.outputs.IMAGE_TAG }}" \
-             '.version = $version | .packages[0].identifier = $image' server.json > server.json.tmp
-          mv server.json.tmp server.json
-
-      - name: Login to MCP Registry
-        run: mcp-publisher login github-oidc
-
-      - name: Publish to MCP Registry
-        run: mcp-publisher publish
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: github.event_name == 'workflow_dispatch'
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          platforms: ${{ needs.prepare.outputs.platforms }}
+          build-args: VERSION=${{ needs.prepare.outputs.version }}
+          push: ${{ github.event_name == 'workflow_dispatch' }}
+          tags: |
+            ${{ needs.prepare.outputs.repository }}:${{ needs.prepare.outputs.version }}${{ matrix.suffix }}
+            ${{ needs.prepare.outputs.repository }}:${{ matrix.alias }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
