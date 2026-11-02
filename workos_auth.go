@@ -176,7 +176,7 @@ func (a *WorkOSAuth) request(ctx context.Context, method, target, token string) 
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("WorkOS request failed")
 	}
 	const maxBody = 64 << 10

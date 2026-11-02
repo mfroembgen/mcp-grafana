@@ -149,8 +149,11 @@ func TestWorkOSAuthProfileAndCredentialBoundary(t *testing.T) {
 		handler.ServeHTTP(rec, req)
 		return rec.Code
 	}
-	require.Equal(t, http.StatusOK, request())
-	require.True(t, reached)
+	for _, success := range []int{http.StatusOK, http.StatusCreated} {
+		status, reached = success, false
+		require.Equal(t, http.StatusOK, request())
+		require.True(t, reached)
+	}
 	for _, invalid := range []string{
 		`{"sub":"user_other","email":"reader@example.com","email_verified":true}`,
 		`{"sub":"user_test","email":"reader@sub.example.com","email_verified":true}`,
