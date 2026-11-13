@@ -309,7 +309,7 @@ func TestWorkOSAuthRefreshSurvivesCallerCancellation(t *testing.T) {
 	<-started
 	cancel()
 	close(release)
-	<-done
+	require.Error(t, <-done, "the cancelled caller must not receive the unknown key")
 	public, err := a.publicKey(t.Context(), "key1")
 	require.NoError(t, err, "a disconnected caller must not prevent valid users from loading keys")
 	require.Equal(t, &key.PublicKey, public)
