@@ -1,5 +1,5 @@
 # Build stage
-FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:dc0963f32053e4bc451d24d87e3892d42d01021b61f093e98eb95c0352bb84b0 AS builder
 
 # Set the working directory
 WORKDIR /app

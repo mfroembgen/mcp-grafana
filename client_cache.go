@@ -347,11 +347,7 @@ func extractGrafanaClientCached(cache *ClientCache) httpContextFunc {
 	return func(ctx context.Context, req *http.Request) context.Context {
 		config := GrafanaConfigFromContext(ctx)
 		logger := config.LoggerOrDefault()
-		// Under dynamic multi-org the org is chosen per tool call, so an unset
-		// connection-level org is the expected starting point, not a misconfiguration.
-		if config.OrgID == 0 && !DynamicMultiOrgEnabled {
-			logger.Warn("No org ID found in request headers or environment variables, using default org. Set GRAFANA_ORG_ID or pass X-Grafana-Org-Id header to target a specific org.")
-		}
+		logDefaultOrg(logger, config)
 
 		u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req, logger)
 		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, req)
@@ -371,16 +367,16 @@ func extractIncidentClientCached(cache *ClientCache) httpContextFunc {
 		config := GrafanaConfigFromContext(ctx)
 		logger := config.LoggerOrDefault()
 
-		grafanaURL, apiKey, _, orgID := extractKeyGrafanaInfoFromReq(req, logger)
-		key := cacheKeyFromRequest(grafanaURL, apiKey, nil, orgID, req)
+		grafanaURL, apiKey, basicAuth, orgID := extractKeyGrafanaInfoFromReq(req, logger)
+		key := cacheKeyFromRequest(grafanaURL, apiKey, basicAuth, orgID, req)
 
 		incidentClient := cache.GetOrCreateIncidentClient(key, func() *incident.Client {
 			incidentURL := fmt.Sprintf("%s/api/plugins/grafana-irm-app/resources/api/v1/", grafanaURL)
 			logger.Debug("Creating new incident client (cache miss)", "url", incidentURL)
-			client := incident.NewClient(incidentURL, apiKey)
+			client, opts := newIncidentClient(incidentURL, apiKey)
 
 			config.OrgID = orgID
-			transport, err := BuildTransport(&config, nil, WithoutAuth())
+			transport, err := BuildTransport(&config, nil, opts...)
 			switch {
 			case err == nil:
 				client.HTTPClient.Transport = transport
@@ -391,6 +387,7 @@ func extractIncidentClientCached(cache *ClientCache) httpContextFunc {
 			default:
 				logger.Error("Failed to create custom transport for incident client, using default", "error", err)
 			}
+			rejectIncidentErrorStatuses(client)
 
 			return client
 		})

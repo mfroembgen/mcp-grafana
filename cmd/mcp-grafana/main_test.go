@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"log/slog"
 	"net"
 	"net/http"
@@ -16,11 +17,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	mcpgrafana "github.com/grafana/mcp-grafana/v2"
 	"github.com/grafana/mcp-grafana/v2/observability"
+	"github.com/grafana/mcp-grafana/v2/resources"
 	"github.com/grafana/mcp-grafana/v2/usagestats"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
@@ -35,6 +38,49 @@ func newTestObservability(t *testing.T) *observability.Observability {
 		_ = obs.Shutdown(context.Background())
 	})
 	return obs
+}
+
+func TestDynamicHTTPAddressIsPublishedAndServed(t *testing.T) {
+	t.Chdir(t.TempDir())
+	require.NoError(t, os.WriteFile(dynamicAddressFileName, []byte("stale\n"), 0o644))
+	requestedAddress := "localhost:0"
+	listener, err := listenHTTP(requestedAddress)
+	require.NoError(t, err)
+
+	document, err := os.ReadFile(dynamicAddressFileName)
+	require.NoError(t, err)
+	address := strings.TrimSpace(string(document))
+	assert.Equal(t, listener.Addr().String(), address)
+	_, port, err := net.SplitHostPort(address)
+	require.NoError(t, err)
+	assert.NotEqual(t, "0", port)
+	info, err := os.Stat(dynamicAddressFileName)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", handleHealthz)
+	server := &http.Server{
+		Handler: mcpgrafana.DNSRebindingProtectionMiddleware(
+			(httpSecurityConfig{}).policy(address, addressWithBoundPort(requestedAddress, address)),
+		)(mux),
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+	go func() { done <- runHTTPServer(ctx, server, listener, "test", tlsConfig{}) }()
+
+	_, port, err = net.SplitHostPort(address)
+	require.NoError(t, err)
+	requestURL := "http://" + net.JoinHostPort("localhost", port) + "/healthz"
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, requestURL, nil)
+	require.NoError(t, err)
+	response, err := (&http.Client{Timeout: time.Second}).Do(request)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+	require.NoError(t, response.Body.Close())
+	cancel()
+	require.NoError(t, <-done)
 }
 
 func TestBuildInstructions_ReflectsEnabledCategories(t *testing.T) {
@@ -557,9 +603,10 @@ func TestHandleFlagsPostParse(t *testing.T) {
 func TestApplyLokiGuardrailEnv(t *testing.T) {
 	// Flag defaults as registered in addFlags.
 	defaults := grafanaConfig{
-		lokiGuardrailMode:     "off",
-		lokiGuardrailMaxBytes: 100 << 30,
-		lokiGuardrailMaxRange: 24 * time.Hour,
+		lokiGuardrailMode:      "off",
+		lokiGuardrailMaxBytes:  100 << 30,
+		lokiGuardrailMaxRange:  24 * time.Hour,
+		lokiGuardrailOnFailure: "allow",
 	}
 
 	tests := []struct {
@@ -668,12 +715,142 @@ func TestValidateLokiGuardrail(t *testing.T) {
 		{name: "shadow with limits is valid", gc: grafanaConfig{lokiGuardrailMode: "shadow", lokiGuardrailMaxBytes: 100 << 30, lokiGuardrailMaxRange: 24 * time.Hour}},
 		{name: "zero limits disable checks", gc: grafanaConfig{lokiGuardrailMode: "enforce"}},
 		{name: "unknown mode rejected", gc: grafanaConfig{lokiGuardrailMode: "Enforce"}, wantErrSubstr: "invalid Loki guardrail mode"},
+		{name: "block on estimate failure is valid", gc: grafanaConfig{lokiGuardrailMode: "enforce", lokiGuardrailOnFailure: "block"}},
+		{name: "unknown estimate-failure behaviour rejected", gc: grafanaConfig{lokiGuardrailMode: "enforce", lokiGuardrailOnFailure: "deny"}, wantErrSubstr: "GRAFANA_LOKI_GUARDRAIL_ON_ESTIMATE_FAILURE"},
 		{name: "negative max bytes rejected", gc: grafanaConfig{lokiGuardrailMode: "enforce", lokiGuardrailMaxBytes: -1}, wantErrSubstr: "GRAFANA_LOKI_GUARDRAIL_MAX_BYTES"},
 		{name: "negative max range rejected", gc: grafanaConfig{lokiGuardrailMode: "enforce", lokiGuardrailMaxRange: -time.Hour}, wantErrSubstr: "GRAFANA_LOKI_GUARDRAIL_MAX_RANGE"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.gc.validateLokiGuardrail()
+			if tc.wantErrSubstr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErrSubstr)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// TestApplyPrometheusGuardrailEnv locks in the same flag-over-env precedence
+// as the Loki guardrail.
+func TestApplyPrometheusGuardrailEnv(t *testing.T) {
+	// Flag defaults as registered in addFlags.
+	defaults := grafanaConfig{
+		prometheusGuardrailMode:      "off",
+		prometheusGuardrailMaxRange:  192 * time.Hour,
+		prometheusGuardrailMaxPoints: 11000,
+	}
+
+	tests := []struct {
+		name          string
+		env           map[string]string
+		setFlags      map[string]bool
+		wantMode      string
+		wantMaxRange  time.Duration
+		wantMaxPoints int64
+		wantErrSubstr string
+	}{
+		{
+			name: "env-only applies to all three settings",
+			env: map[string]string{
+				"GRAFANA_PROMETHEUS_GUARDRAIL_MODE":       "enforce",
+				"GRAFANA_PROMETHEUS_GUARDRAIL_MAX_RANGE":  "24h",
+				"GRAFANA_PROMETHEUS_GUARDRAIL_MAX_POINTS": "500",
+			},
+			wantMode:      "enforce",
+			wantMaxRange:  24 * time.Hour,
+			wantMaxPoints: 500,
+		},
+		{
+			name: "flag-set wins over env",
+			env: map[string]string{
+				"GRAFANA_PROMETHEUS_GUARDRAIL_MODE":       "enforce",
+				"GRAFANA_PROMETHEUS_GUARDRAIL_MAX_RANGE":  "24h",
+				"GRAFANA_PROMETHEUS_GUARDRAIL_MAX_POINTS": "500",
+			},
+			setFlags: map[string]bool{
+				"prometheus-guardrail-mode":       true,
+				"prometheus-guardrail-max-range":  true,
+				"prometheus-guardrail-max-points": true,
+			},
+			wantMode:      defaults.prometheusGuardrailMode,
+			wantMaxRange:  defaults.prometheusGuardrailMaxRange,
+			wantMaxPoints: defaults.prometheusGuardrailMaxPoints,
+		},
+		{
+			name: "flag-set is per setting",
+			env: map[string]string{
+				"GRAFANA_PROMETHEUS_GUARDRAIL_MODE":       "shadow",
+				"GRAFANA_PROMETHEUS_GUARDRAIL_MAX_POINTS": "500",
+			},
+			setFlags:      map[string]bool{"prometheus-guardrail-max-points": true},
+			wantMode:      "shadow",
+			wantMaxRange:  defaults.prometheusGuardrailMaxRange,
+			wantMaxPoints: defaults.prometheusGuardrailMaxPoints,
+		},
+		{
+			name:          "empty env ignored",
+			env:           map[string]string{"GRAFANA_PROMETHEUS_GUARDRAIL_MODE": ""},
+			wantMode:      defaults.prometheusGuardrailMode,
+			wantMaxRange:  defaults.prometheusGuardrailMaxRange,
+			wantMaxPoints: defaults.prometheusGuardrailMaxPoints,
+		},
+		{
+			// Go durations have no day unit, so the docs say 192h, not 8d.
+			name:          "day unit in MAX_RANGE errors",
+			env:           map[string]string{"GRAFANA_PROMETHEUS_GUARDRAIL_MAX_RANGE": "8d"},
+			wantErrSubstr: "GRAFANA_PROMETHEUS_GUARDRAIL_MAX_RANGE",
+		},
+		{
+			name:          "invalid MAX_POINTS errors",
+			env:           map[string]string{"GRAFANA_PROMETHEUS_GUARDRAIL_MAX_POINTS": "11k"},
+			wantErrSubstr: "GRAFANA_PROMETHEUS_GUARDRAIL_MAX_POINTS",
+		},
+	}
+
+	envVars := []string{
+		"GRAFANA_PROMETHEUS_GUARDRAIL_MODE",
+		"GRAFANA_PROMETHEUS_GUARDRAIL_MAX_RANGE",
+		"GRAFANA_PROMETHEUS_GUARDRAIL_MAX_POINTS",
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range envVars {
+				t.Setenv(k, tc.env[k])
+			}
+			gc := defaults
+			err := gc.applyPrometheusGuardrailEnv(tc.setFlags)
+			if tc.wantErrSubstr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErrSubstr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantMode, gc.prometheusGuardrailMode)
+			assert.Equal(t, tc.wantMaxRange, gc.prometheusGuardrailMaxRange)
+			assert.Equal(t, tc.wantMaxPoints, gc.prometheusGuardrailMaxPoints)
+		})
+	}
+}
+
+func TestValidatePrometheusGuardrail(t *testing.T) {
+	tests := []struct {
+		name          string
+		gc            grafanaConfig
+		wantErrSubstr string
+	}{
+		{name: "off is valid", gc: grafanaConfig{prometheusGuardrailMode: "off"}},
+		{name: "shadow with limits is valid", gc: grafanaConfig{prometheusGuardrailMode: "shadow", prometheusGuardrailMaxRange: 192 * time.Hour, prometheusGuardrailMaxPoints: 11000}},
+		{name: "zero limits disable checks", gc: grafanaConfig{prometheusGuardrailMode: "enforce"}},
+		{name: "unknown mode rejected", gc: grafanaConfig{prometheusGuardrailMode: "Enforce"}, wantErrSubstr: "invalid Prometheus guardrail mode"},
+		{name: "negative max range rejected", gc: grafanaConfig{prometheusGuardrailMode: "enforce", prometheusGuardrailMaxRange: -time.Hour}, wantErrSubstr: "GRAFANA_PROMETHEUS_GUARDRAIL_MAX_RANGE"},
+		{name: "negative max points rejected", gc: grafanaConfig{prometheusGuardrailMode: "enforce", prometheusGuardrailMaxPoints: -1}, wantErrSubstr: "GRAFANA_PROMETHEUS_GUARDRAIL_MAX_POINTS"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.gc.validatePrometheusGuardrail()
 			if tc.wantErrSubstr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tc.wantErrSubstr)
@@ -717,6 +894,18 @@ func TestHTTPSecurityConfigPolicy(t *testing.T) {
 			name:        "unset --allowed-hosts falls back to defaults",
 			address:     "localhost:8000",
 			wantHosts:   []string{"localhost:8000", "127.0.0.1:8000", "[::1]:8000"},
+			wantOrigins: nil,
+		},
+		{
+			name:        "IPv4 wildcard bind also allows the published address",
+			address:     "0.0.0.0:8000",
+			wantHosts:   []string{"0.0.0.0:8000", "localhost:8000", "127.0.0.1:8000", "[::1]:8000"},
+			wantOrigins: nil,
+		},
+		{
+			name:        "IPv6 wildcard bind also allows the published address",
+			address:     "[::]:8000",
+			wantHosts:   []string{"[::]:8000", "localhost:8000", "127.0.0.1:8000", "[::1]:8000"},
 			wantOrigins: nil,
 		},
 		{
@@ -1060,7 +1249,7 @@ func TestValidateServerName(t *testing.T) {
 
 func TestNewServer_DefaultServerName(t *testing.T) {
 	obs := newTestObservability(t)
-	s := newServer(defaultServerName, disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "")
+	s := newServer(defaultServerName, disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "", 0)
 
 	name := getServerNameFromInitialize(t, s)
 	assert.Equal(t, "mcp-grafana", name)
@@ -1068,7 +1257,7 @@ func TestNewServer_DefaultServerName(t *testing.T) {
 
 func TestNewServer_CustomServerName(t *testing.T) {
 	obs := newTestObservability(t)
-	s := newServer("my-custom-server", disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "")
+	s := newServer("my-custom-server", disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "", 0)
 
 	name := getServerNameFromInitialize(t, s)
 	assert.Equal(t, "my-custom-server", name)
@@ -1077,9 +1266,9 @@ func TestNewServer_CustomServerName(t *testing.T) {
 func TestNewServer_MultiInstanceDistinctNames(t *testing.T) {
 	obs := newTestObservability(t)
 
-	sAlpha := newServer("instance-alpha", disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "")
+	sAlpha := newServer("instance-alpha", disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "", 0)
 
-	sBeta := newServer("instance-beta", disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "")
+	sBeta := newServer("instance-beta", disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "", 0)
 
 	nameAlpha := getServerNameFromInitialize(t, sAlpha)
 	nameBeta := getServerNameFromInitialize(t, sBeta)
@@ -1091,7 +1280,7 @@ func TestNewServer_MultiInstanceDistinctNames(t *testing.T) {
 
 func TestCustomServerName_DoesNotAffectUserAgent(t *testing.T) {
 	obs := newTestObservability(t)
-	s := newServer("my-custom-instance", disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "")
+	s := newServer("my-custom-instance", disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "", 0)
 
 	name := getServerNameFromInitialize(t, s)
 	assert.Equal(t, "my-custom-instance", name)
@@ -1225,6 +1414,7 @@ func TestSOCKS5ProxyFromEnv(t *testing.T) {
 // data. --disable-query removes them; --disable-write must not.
 var safeQueryToolNames = []string{
 	"query_prometheus",
+	"render_grafana_app",
 	"query_prometheus_histogram",
 	"query_loki_logs",
 	"query_loki_patterns",
@@ -1233,6 +1423,7 @@ var safeQueryToolNames = []string{
 	"query_graphite",
 	"query_graphite_density",
 	"query_cloudwatch",
+	"query_cloudwatch_logs",
 	"query_cloud_logging",
 	"query_pyroscope",
 	"run_panel_query",
@@ -1271,6 +1462,8 @@ var metadataToolNames = []string{
 	"list_cloudwatch_metrics",
 	"list_cloudwatch_dimensions",
 	"list_cloudwatch_dimension_values",
+	"list_cloudwatch_log_groups",
+	"list_cloudwatch_log_group_fields",
 	"list_cloud_logging_projects",
 	"list_cloud_logging_buckets",
 	"list_cloud_logging_views",
@@ -1418,6 +1611,23 @@ func TestProcessTools_EnableWriteToolsRestoresWritableDeeplink(t *testing.T) {
 	assert.NotContains(t, listed, "update_dashboard", "the override must not re-enable other write tools")
 }
 
+func TestProcessTools_EnableWriteToolsRestoresSingleAlertingWriteTool(t *testing.T) {
+	writeTools := []string{"alerting_rules_write", "alerting_routing_write", "alerting_silences_write"}
+	for _, selected := range writeTools {
+		t.Run(selected, func(t *testing.T) {
+			listed := listAllCategoryTools(t, disabledTools{write: true, writeToolOverrides: selected})
+			require.Contains(t, listed, selected)
+			assert.False(t, listed[selected].Annotations.ReadOnlyHint)
+			for _, name := range writeTools {
+				if name != selected {
+					assert.NotContains(t, listed, name, "the override must not re-enable other alerting write tools")
+				}
+			}
+			assert.NotContains(t, listed, "update_dashboard", "the override must not re-enable other write tools")
+		})
+	}
+}
+
 func TestProcessTools_DisableWriteRegistersReadOnlyDeeplink(t *testing.T) {
 	listed := listAllCategoryTools(t, disabledTools{write: true})
 	require.Contains(t, listed, "generate_deeplink")
@@ -1522,7 +1732,7 @@ func TestRegisterOps_HealthzAddressDoesNotEnableMetrics(t *testing.T) {
 // error (-32603) with a bare Go unmarshal message. See issue #830.
 func TestNewServer_InvalidArgumentTypeReturnsToolErrorNotProtocolError(t *testing.T) {
 	obs := newTestObservability(t)
-	s := newServer(defaultServerName, disabledTools{enabledTools: "datasource"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "")
+	s := newServer(defaultServerName, disabledTools{enabledTools: "datasource"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "", 0)
 
 	session := connectTestClient(t, s)
 
@@ -1629,12 +1839,103 @@ func TestEffectiveMetricsEnabled(t *testing.T) {
 	assert.False(t, effectiveMetricsEnabled("streamable-http", false))
 }
 
+func TestValidateSSEKeepAlive(t *testing.T) {
+	assert.NoError(t, validateSSEKeepAlive(0), "0 disables keepalive")
+	assert.NoError(t, validateSSEKeepAlive(30*time.Second))
+
+	assert.NoError(t, validateSSEKeepAlive(time.Second), "the minimum is allowed")
+
+	err := validateSSEKeepAlive(-time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--sse-keepalive")
+
+	// A typo like 1ms would disconnect every client almost at once.
+	for _, d := range []time.Duration{time.Millisecond, 100 * time.Microsecond, 999 * time.Millisecond} {
+		err := validateSSEKeepAlive(d)
+		require.Error(t, err, d)
+		assert.Contains(t, err.Error(), "at least 1s")
+	}
+}
+
+func TestEffectiveSSEKeepAlive(t *testing.T) {
+	assert.Equal(t, 30*time.Second, effectiveSSEKeepAlive("sse", 30*time.Second))
+	assert.Zero(t, effectiveSSEKeepAlive("sse", 0))
+	// Only the SSE transport's idle event stream needs pings to survive a proxy.
+	assert.Zero(t, effectiveSSEKeepAlive("streamable-http", 30*time.Second))
+	assert.Zero(t, effectiveSSEKeepAlive("stdio", 30*time.Second))
+}
+
+// connectSSEPingCounter serves s over the SSE transport, the way run() does
+// for --transport sse, and connects a client that counts the ping requests it
+// receives from the server on the event stream.
+func connectSSEPingCounter(t *testing.T, s *mcp.Server) *atomic.Int32 {
+	t.Helper()
+	return connectSSEPingCounterWithDelay(t, s, 0)
+}
+
+// connectSSEPingCounterWithDelay is connectSSEPingCounter, but the client
+// waits firstPingDelay before answering the first ping.
+func connectSSEPingCounterWithDelay(t *testing.T, s *mcp.Server, firstPingDelay time.Duration) *atomic.Int32 {
+	t.Helper()
+	srv := httptest.NewServer(mcp.NewSSEHandler(func(*http.Request) *mcp.Server { return s }, nil))
+	t.Cleanup(srv.Close)
+
+	var pings atomic.Int32
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	client.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			if method == "ping" && pings.Add(1) == 1 && firstPingDelay > 0 {
+				time.Sleep(firstPingDelay)
+			}
+			return next(ctx, method, req)
+		}
+	})
+	session, err := client.Connect(context.Background(), &mcp.SSEClientTransport{Endpoint: srv.URL}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = session.Close() })
+	return &pings
+}
+
+// TestNewServer_SSEKeepAlive covers issue #1365: with --sse-keepalive set, the
+// server pings SSE clients so an idle event stream is never idle long enough
+// for a reverse proxy to close it.
+func TestNewServer_SSEKeepAlive(t *testing.T) {
+	const interval = 200 * time.Millisecond
+	usage := usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled})
+
+	t.Run("enabled sends pings on the SSE stream", func(t *testing.T) {
+		s := newServer(defaultServerName, disabledTools{enabledTools: "search"}, newTestObservability(t), usage, "", interval)
+		pings := connectSSEPingCounter(t, s)
+
+		assert.Eventually(t, func() bool { return pings.Load() >= 2 }, 5*time.Second, 20*time.Millisecond,
+			"expected at least two keepalive pings")
+	})
+
+	t.Run("one slow ping reply does not close the session", func(t *testing.T) {
+		s := newServer(defaultServerName, disabledTools{enabledTools: "search"}, newTestObservability(t), usage, "", interval)
+		// The first reply misses its interval/2 deadline. With a failure
+		// threshold of 1 the server would close the session and stop pinging.
+		pings := connectSSEPingCounterWithDelay(t, s, interval)
+
+		assert.Eventually(t, func() bool { return pings.Load() >= 3 }, 5*time.Second, 20*time.Millisecond,
+			"expected pings to continue after one missed reply")
+	})
+
+	t.Run("disabled sends no pings", func(t *testing.T) {
+		s := newServer(defaultServerName, disabledTools{enabledTools: "search"}, newTestObservability(t), usage, "", 0)
+		pings := connectSSEPingCounter(t, s)
+
+		time.Sleep(3 * interval)
+		assert.Zero(t, pings.Load(), "no pings expected when keepalive is disabled")
+	})
+}
+
 // TestListToolsResult_ReturnsTools verifies that tools/list returns the
 // expected tools via the go-sdk. The mark3labs-specific resultType/cacheScope/
 // ttlMs fields (#1140) are handled natively by the go-sdk's Cacheable struct.
 func TestListToolsResult_ReturnsTools(t *testing.T) {
 	obs := newTestObservability(t)
-	s := newServer(defaultServerName, disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "")
+	s := newServer(defaultServerName, disabledTools{enabledTools: "search"}, obs, usagestats.New(usagestats.Config{Mode: usagestats.ModeDisabled}), "", 0)
 
 	session := connectTestClient(t, s)
 	result, err := session.ListTools(context.Background(), nil)
@@ -1974,4 +2275,87 @@ func TestValidateMountFlags_SSEBasePath(t *testing.T) {
 	err = validateMountFlags("sse", "/my base/", "", "", observability.Config{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), strconv.Quote(sseEndpointPath(normalizeBasePath("/my base/"))))
+}
+
+func TestApplyLokiGuardrailEnvOnEstimateFailure(t *testing.T) {
+	t.Setenv("GRAFANA_LOKI_GUARDRAIL_ON_ESTIMATE_FAILURE", "block")
+	gc := grafanaConfig{lokiGuardrailOnFailure: "allow"}
+	require.NoError(t, gc.applyLokiGuardrailEnv(nil))
+	assert.Equal(t, "block", gc.lokiGuardrailOnFailure)
+
+	gc = grafanaConfig{lokiGuardrailOnFailure: "allow"}
+	require.NoError(t, gc.applyLokiGuardrailEnv(map[string]bool{"loki-guardrail-on-estimate-failure": true}))
+	assert.Equal(t, "allow", gc.lokiGuardrailOnFailure, "an explicit flag wins over the environment")
+}
+
+func TestResourceKindsFollowToolCategories(t *testing.T) {
+	const (
+		datasources = "grafana://datasources/{uid}"
+		incidents   = "grafana://irm/incidents/{id}"
+	)
+	for _, tc := range []struct {
+		name   string
+		config disabledTools
+		want   []string
+	}{
+		{"all", disabledTools{enabledTools: "datasource,incident"}, []string{datasources, incidents}},
+		{"datasource disabled", disabledTools{enabledTools: "datasource,incident", datasource: true}, []string{incidents}},
+		{"incident disabled", disabledTools{enabledTools: "datasource,incident", incident: true}, []string{datasources}},
+		{"none enabled", disabledTools{enabledTools: "search"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "1"}, nil)
+			mcpgrafana.RegisterAppResources(s) // advertises the resources capability either way
+			resources.Register(s, tc.config.resourceKinds()...)
+			result, err := connectTestClient(t, s).ListResourceTemplates(t.Context(), nil)
+			require.NoError(t, err)
+			var got []string
+			for _, rt := range result.ResourceTemplates {
+				got = append(got, rt.URITemplate)
+			}
+			assert.ElementsMatch(t, tc.want, got)
+		})
+	}
+}
+
+func TestPrometheusSelectiveLabelsEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name, value                       string
+		flagSet, initial, want, wantError bool
+	}{
+		{"default off", "", false, false, false, false},
+		{"env enables", "true", false, false, true, false},
+		{"env disables", "false", false, true, false, false},
+		{"explicit false wins", "true", true, false, false, false},
+		{"explicit true wins", "false", true, true, true, false},
+		{"invalid env", "enabled", false, false, false, true},
+		{"explicit flag ignores invalid env", "enabled", true, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, name := range []string{"MODE", "MAX_RANGE", "MAX_POINTS"} {
+				t.Setenv("GRAFANA_PROMETHEUS_GUARDRAIL_"+name, "")
+			}
+			t.Setenv("GRAFANA_PROMETHEUS_GUARDRAIL_REQUIRE_SELECTIVE_LABELS", tc.value)
+			gc := grafanaConfig{prometheusGuardrailRequireSelectiveLabels: tc.initial}
+			err := gc.applyPrometheusGuardrailEnv(map[string]bool{"prometheus-guardrail-require-selective-labels": tc.flagSet})
+			if tc.wantError {
+				require.ErrorContains(t, err, "GRAFANA_PROMETHEUS_GUARDRAIL_REQUIRE_SELECTIVE_LABELS")
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, gc.prometheusGuardrailRequireSelectiveLabels)
+			}
+		})
+	}
+}
+
+func TestPrometheusSelectiveLabelsFlag(t *testing.T) {
+	previous := flag.CommandLine
+	t.Cleanup(func() { flag.CommandLine = previous })
+	for _, args := range [][]string{nil, {"--prometheus-guardrail-require-selective-labels"}, {"--prometheus-guardrail-require-selective-labels=false"}} {
+		flag.CommandLine = flag.NewFlagSet("test", flag.ContinueOnError)
+		gc := grafanaConfig{}
+		gc.addFlags()
+		require.NoError(t, flag.CommandLine.Parse(args))
+		assert.Equal(t, len(args) > 0 && args[0] == "--prometheus-guardrail-require-selective-labels", gc.prometheusGuardrailRequireSelectiveLabels)
+	}
 }

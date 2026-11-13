@@ -3,6 +3,7 @@ package mcpgrafana
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/go-openapi/runtime/client"
 	grafana_client "github.com/grafana/grafana-openapi-client-go/client"
 	"github.com/grafana/grafana-openapi-client-go/client/datasources"
+	"github.com/grafana/incident-go"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -97,6 +99,106 @@ func TestExtractIncidentClientFromHeaders(t *testing.T) {
 		require.NotNil(t, client)
 		assert.Equal(t, "http://configured.grafana.com/api/plugins/grafana-irm-app/resources/api/v1/", client.RemoteHost)
 	})
+}
+
+func TestIncidentClientAuth(t *testing.T) {
+	type captured struct {
+		auth        []string
+		accessToken string
+		idToken     string
+	}
+	basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:secret"))
+
+	// Each builder returns the incident client and the context its tools would use.
+	builders := map[string]func(t *testing.T, apiKey string, basicAuth, obo bool) (*incident.Client, context.Context){
+		"env": func(t *testing.T, apiKey string, basicAuth, obo bool) (*incident.Client, context.Context) {
+			t.Setenv("GRAFANA_SERVICE_ACCOUNT_TOKEN", apiKey)
+			if basicAuth {
+				t.Setenv("GRAFANA_USERNAME", "admin")
+				t.Setenv("GRAFANA_PASSWORD", "secret")
+			}
+			ctx := ExtractGrafanaInfoFromEnv(context.Background())
+			if obo {
+				ctx = MustWithOnBehalfOfAuth(ctx, "access-token", "id-token")
+			}
+			ctx = ExtractIncidentClientFromEnv(ctx)
+			return IncidentClientFromContext(ctx), ctx
+		},
+		"headers": func(t *testing.T, apiKey string, basicAuth, obo bool) (*incident.Client, context.Context) {
+			req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+			if apiKey != "" {
+				req.Header.Set(grafanaServiceAccountTokenHeader, apiKey)
+			}
+			if basicAuth {
+				req.SetBasicAuth("admin", "secret")
+			}
+			ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
+			if obo {
+				ctx = MustWithOnBehalfOfAuth(ctx, "access-token", "id-token")
+			}
+			ctx = ExtractIncidentClientFromHeaders(ctx, req)
+			return IncidentClientFromContext(ctx), ctx
+		},
+		"cached": func(t *testing.T, apiKey string, basicAuth, obo bool) (*incident.Client, context.Context) {
+			cache := NewClientCache(nil)
+			t.Cleanup(cache.Close)
+			req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+			if apiKey != "" {
+				req.Header.Set(grafanaServiceAccountTokenHeader, apiKey)
+			}
+			if basicAuth {
+				req.SetBasicAuth("admin", "secret")
+			}
+			ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
+			if obo {
+				ctx = MustWithOnBehalfOfAuth(ctx, "access-token", "id-token")
+			}
+			ctx = extractIncidentClientCached(cache)(ctx, req)
+			return IncidentClientFromContext(ctx), ctx
+		},
+	}
+
+	cases := []struct {
+		name      string
+		apiKey    string
+		basicAuth bool
+		obo       bool
+		want      captured
+	}{
+		{name: "basic auth without token", basicAuth: true, want: captured{auth: []string{basic}}},
+		{name: "token", apiKey: "glsa_token", want: captured{auth: []string{"Bearer glsa_token"}}},
+		{name: "token wins over basic auth", apiKey: "glsa_token", basicAuth: true, want: captured{auth: []string{"Bearer glsa_token"}}},
+		{name: "on-behalf-of without token", obo: true, want: captured{accessToken: "access-token", idToken: "id-token"}},
+	}
+
+	for builderName, build := range builders {
+		for _, tc := range cases {
+			t.Run(builderName+"/"+tc.name, func(t *testing.T) {
+				var got captured
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					got = captured{
+						auth:        r.Header.Values("Authorization"),
+						accessToken: r.Header.Get("X-Access-Token"),
+						idToken:     r.Header.Get("X-Grafana-Id"),
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{}`))
+				}))
+				defer srv.Close()
+				t.Setenv("GRAFANA_URL", srv.URL)
+				t.Setenv("GRAFANA_API_KEY", "")
+				t.Setenv("GRAFANA_SERVICE_ACCOUNT_TOKEN", "")
+				t.Setenv("GRAFANA_USERNAME", "")
+				t.Setenv("GRAFANA_PASSWORD", "")
+
+				client, ctx := build(t, tc.apiKey, tc.basicAuth, tc.obo)
+				require.NotNil(t, client)
+				_, err := incident.NewIncidentsService(client).GetIncident(ctx, incident.GetIncidentRequest{IncidentID: "1"})
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, got)
+			})
+		}
+	}
 }
 
 func TestExtractGrafanaInfoFromHeaders(t *testing.T) {
@@ -1976,7 +2078,7 @@ func TestFetchPublicURL(t *testing.T) {
 	})
 }
 
-func TestNewGrafanaClientFetchesPublicURL(t *testing.T) {
+func TestGrafanaPublicURLFetchesOnFirstUse(t *testing.T) {
 	t.Cleanup(clearSharedSettingsCache)
 
 	t.Run("stores public URL from frontend settings", func(t *testing.T) {
@@ -1992,7 +2094,7 @@ func TestNewGrafanaClientFetchesPublicURL(t *testing.T) {
 
 		ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{})
 		gc := NewGrafanaClient(ctx, ts.URL, "test-key", nil)
-		assert.Equal(t, "https://public.grafana.example.com", gc.PublicURL)
+		assert.Equal(t, "https://public.grafana.example.com", GrafanaPublicURL(WithGrafanaClient(ctx, gc)))
 	})
 
 	t.Run("public URL is empty when fetch fails", func(t *testing.T) {
@@ -2007,14 +2109,14 @@ func TestNewGrafanaClientFetchesPublicURL(t *testing.T) {
 
 		ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{})
 		gc := NewGrafanaClient(ctx, ts.URL, "test-key", nil)
-		assert.Equal(t, "", gc.PublicURL)
+		assert.Equal(t, "", GrafanaPublicURL(WithGrafanaClient(ctx, gc)))
 	})
 }
 
-func TestNewGrafanaClientFetchesVersion(t *testing.T) {
+func TestGrafanaVersionFetchesOnFirstUse(t *testing.T) {
 	t.Cleanup(clearFrontendSettingsCaches)
 
-	t.Run("one settings request populates both public URL and version", func(t *testing.T) {
+	t.Run("public URL and version are fetched once, on first use", func(t *testing.T) {
 		t.Cleanup(clearFrontendSettingsCaches)
 		var settingsCalls int32
 		ts := newTestHTTPServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2030,11 +2132,21 @@ func TestNewGrafanaClientFetchesVersion(t *testing.T) {
 
 		ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{})
 		gc := NewGrafanaClient(ctx, ts.URL, "test-key", nil)
+		assert.Zero(t, atomic.LoadInt32(&settingsCalls), "building a client must not fetch settings")
+		ctx = WithGrafanaClient(ctx, gc)
 
-		assert.Equal(t, "https://public.grafana.example.com", gc.PublicURL)
-		assert.Equal(t, "12.1.0", gc.Version)
+		for range 2 {
+			assert.Equal(t, "https://public.grafana.example.com", GrafanaPublicURL(ctx))
+			assert.Equal(t, "12.1.0", GrafanaVersion(ctx))
+		}
 		assert.Equal(t, int32(1), atomic.LoadInt32(&settingsCalls),
 			"the public URL and the version must come from a single frontend-settings request")
+
+		// A client built after the fetch is filled from the cache.
+		again := NewGrafanaClient(ctx, ts.URL, "test-key", nil)
+		assert.Equal(t, "https://public.grafana.example.com", again.PublicURL)
+		assert.Equal(t, "12.1.0", again.Version)
+		assert.Equal(t, int32(1), atomic.LoadInt32(&settingsCalls))
 	})
 
 	t.Run("version is empty when the fetch fails", func(t *testing.T) {
@@ -2049,15 +2161,16 @@ func TestNewGrafanaClientFetchesVersion(t *testing.T) {
 		})
 
 		ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{})
-		gc := NewGrafanaClient(ctx, ts.URL, "test-key", nil)
-		assert.Empty(t, gc.Version, "an unreadable settings endpoint means unknown, not old")
-		assert.Empty(t, gc.PublicURL)
+		ctx = WithGrafanaClient(ctx, NewGrafanaClient(ctx, ts.URL, "test-key", nil))
+		assert.Empty(t, GrafanaVersion(ctx), "an unreadable settings endpoint means unknown, not old")
+		assert.Empty(t, GrafanaPublicURL(ctx))
 	})
 }
 
 // TestFrontendSettingsSharedByAllConsumers pins the point of the shared cache:
-// building a client is the only request to /api/frontend/settings, and the
-// version and namespace lookups that follow are served from the caches it warmed.
+// the first read of the public URL is the only request to
+// /api/frontend/settings, and the version and namespace lookups that follow
+// are served from the caches it warmed.
 func TestFrontendSettingsSharedByAllConsumers(t *testing.T) {
 	t.Cleanup(clearFrontendSettingsCaches)
 
@@ -2077,7 +2190,7 @@ func TestFrontendSettingsSharedByAllConsumers(t *testing.T) {
 	gc := NewGrafanaClient(ctx, ts.URL, "test-key", nil)
 	ctx = WithGrafanaClient(ctx, gc)
 
-	assert.Equal(t, "https://public.grafana.example.com", gc.PublicURL)
+	assert.Equal(t, "https://public.grafana.example.com", GrafanaPublicURL(ctx))
 	assert.Equal(t, "12.1.0", GrafanaVersion(ctx))
 	ns, err := GrafanaNamespace(ctx)
 	require.NoError(t, err)
@@ -2105,8 +2218,8 @@ func TestNewGrafanaClientTrimsTrailingSlashFromConfiguredURL(t *testing.T) {
 
 	ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{})
 	gc := NewGrafanaClient(ctx, ts.URL+"/", "test-key", nil)
+	assert.Equal(t, "https://public.grafana.example.com", GrafanaPublicURL(WithGrafanaClient(ctx, gc)))
 	assert.Equal(t, "/api/frontend/settings", gotPath)
-	assert.Equal(t, "https://public.grafana.example.com", gc.PublicURL)
 }
 
 // TestNamespaceIsNotSharedAcrossOrgs guards the reason the namespace keeps its
@@ -2752,10 +2865,16 @@ func TestDefaultOrgWarningSuppressedWithDynamicMultiOrg(t *testing.T) {
 		return ctx, req
 	}
 
-	t.Run("warns without dynamic multi-org", func(t *testing.T) {
+	t.Run("per-request note is debug only", func(t *testing.T) {
 		var buf bytes.Buffer
 		ctx, req := newRequestCtx(slog.New(slog.NewTextHandler(&buf, nil)))
 		ExtractGrafanaClientFromHeaders(ctx, req)
+		assert.NotContains(t, buf.String(), "using default org", "no warning on every request")
+
+		buf.Reset()
+		ctx, req = newRequestCtx(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		ExtractGrafanaClientFromHeaders(ctx, req)
+		assert.Contains(t, buf.String(), "level=DEBUG")
 		assert.Contains(t, buf.String(), "using default org")
 	})
 
@@ -2815,4 +2934,65 @@ func TestEnvIgnoresUnsubstitutedMCPBPlaceholders(t *testing.T) {
 
 		assert.Equal(t, int64(0), orgIdFromEnv(logger))
 	})
+}
+
+// The startup warning replaces the per-request one: it fires once when
+// GRAFANA_ORG_ID is unset, and not when it is set or under dynamic multi-org.
+func TestWarnIfOrgIDUnset(t *testing.T) {
+	warn := func() string {
+		var buf bytes.Buffer
+		WarnIfOrgIDUnset(slog.New(slog.NewTextHandler(&buf, nil)))
+		return buf.String()
+	}
+
+	t.Run("warns when unset", func(t *testing.T) {
+		t.Setenv("GRAFANA_ORG_ID", "")
+		out := warn()
+		assert.Contains(t, out, "level=WARN")
+		assert.Contains(t, out, "GRAFANA_ORG_ID is not set")
+	})
+
+	t.Run("silent when set", func(t *testing.T) {
+		t.Setenv("GRAFANA_ORG_ID", "2")
+		assert.Empty(t, warn())
+	})
+
+	t.Run("silent with dynamic multi-org", func(t *testing.T) {
+		t.Setenv("GRAFANA_ORG_ID", "")
+		DynamicMultiOrgEnabled = true
+		t.Cleanup(func() { DynamicMultiOrgEnabled = false })
+		assert.Empty(t, warn())
+	})
+}
+
+// Building a Grafana client happens on every HTTP JSON-RPC message, discovery
+// included, so it must not dial Grafana. Neither the bare constructor nor the
+// composed HTTP context function (uncached and cached) may make a request.
+func TestBuildingGrafanaClientMakesNoRequests(t *testing.T) {
+	t.Cleanup(clearFrontendSettingsCaches)
+	clearFrontendSettingsCaches()
+
+	var calls int32
+	ts := newTestHTTPServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		http.Error(w, "unreachable", http.StatusServiceUnavailable)
+	})
+	t.Setenv("GRAFANA_URL", ts.URL)
+	t.Setenv("GRAFANA_SERVICE_ACCOUNT_TOKEN", "env-token")
+
+	ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{})
+	gc := NewGrafanaClient(ctx, ts.URL, "test-key", nil)
+	require.NotNil(t, gc)
+
+	req, err := http.NewRequest(http.MethodPost, "http://mcp.example.com/mcp", nil)
+	require.NoError(t, err)
+	got := ComposedHTTPContextFunc(GrafanaConfig{})(context.Background(), req)
+	require.NotNil(t, GrafanaClientFromContext(got))
+
+	cache := NewClientCache(nil)
+	t.Cleanup(cache.Close)
+	got = ComposedHTTPContextFunc(GrafanaConfig{}, cache)(context.Background(), req)
+	require.NotNil(t, GrafanaClientFromContext(got))
+
+	assert.Zero(t, atomic.LoadInt32(&calls))
 }

@@ -51,7 +51,7 @@ var AlertRulesRead = mcpgrafana.MustTool(
 var AlertRulesWrite = mcpgrafana.MustTool(
 	"alerting_rules_write",
 	alertRulesWriteDescription,
-	manageRulesReadWrite,
+	manageRulesWrite,
 	mcpgrafana.WithTitleAnnotation("Write alert rules"),
 	mcpgrafana.WithReadOnlyHintAnnotation(false),
 	mcpgrafana.WithDestructiveHintAnnotation(true),
@@ -63,17 +63,20 @@ var AlertRulesWrite = mcpgrafana.MustTool(
 	),
 )
 
-func AddAlertingTools(s *mcp.Server, enableWriteTools bool) {
+// AddAlertingTools registers the alerting tools. Each write tool is registered
+// only when writeEnabled reports its name as enabled, so it can be opted back in
+// individually under --disable-write.
+func AddAlertingTools(s *mcp.Server, writeEnabled func(name string) bool) {
 	AlertRulesRead.Register(s)
-	if enableWriteTools {
+	if writeEnabled(AlertRulesWrite.Tool.Name) {
 		AlertRulesWrite.Register(s)
 	}
 	ManageRouting.Register(s)
-	if enableWriteTools {
+	if writeEnabled(AlertRoutingWrite.Tool.Name) {
 		AlertRoutingWrite.Register(s)
 	}
 	AlertSilencesRead.Register(s)
-	if enableWriteTools {
+	if writeEnabled(AlertSilencesWrite.Tool.Name) {
 		AlertSilencesWrite.Register(s)
 	}
 }

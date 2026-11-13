@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -23,13 +24,17 @@ import (
 
 	mcpgrafana "github.com/grafana/mcp-grafana/v2"
 	"github.com/grafana/mcp-grafana/v2/observability"
+	"github.com/grafana/mcp-grafana/v2/resources"
 	"github.com/grafana/mcp-grafana/v2/tools"
 	"github.com/grafana/mcp-grafana/v2/usagestats"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/semconv/v1.40.0/mcpconv"
 )
 
-const defaultServerName = "mcp-grafana"
+const (
+	defaultServerName      = "mcp-grafana"
+	dynamicAddressFileName = "mcp-grafana-address"
+)
 
 var serverNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
@@ -98,7 +103,7 @@ var categoryDescription = map[string]string{
 	"cloudwatch":    "CloudWatch: Query AWS CloudWatch datasources for metrics and logs.",
 	"cloudlogging":  "Google Cloud Logging: Query logs with the Cloud Logging query language and list projects, log buckets, and views.",
 	"examples":      "Examples: Query example tools.",
-	"sql":           "SQL: Query supported SQL datasources (ClickHouse, Snowflake, Athena, MySQL, PostgreSQL, MSSQL) via Grafana with macro substitution, schema discovery, and variable support.",
+	"sql":           "SQL: Query supported SQL datasources (ClickHouse, Snowflake, Athena, MySQL, PostgreSQL, MSSQL, BigQuery) via Grafana with macro substitution, schema discovery, and variable support.",
 	"runpanelquery": "Run Panel Query: Execute panel queries directly.",
 	"graphite":      "Graphite: Query Graphite datasources for metrics.",
 	"api":           "API: Make authenticated HTTP requests to any Grafana API endpoint with optional jq-style response filtering.",
@@ -114,9 +119,9 @@ var categoryDescriptionNoQuery = map[string]string{
 	"prometheus":   "Prometheus: Retrieve metric metadata and explore metric names and label names/values. Query execution is disabled.",
 	"loki":         "Loki: Retrieve log metadata and index stats, explore label names/values, and audit label strategy. Log query execution is disabled.",
 	"pyroscope":    "Pyroscope: Explore profile types and label names/values. Query execution is disabled.",
-	"cloudwatch":   "CloudWatch: List AWS CloudWatch namespaces, metrics, and dimensions. Query execution is disabled.",
+	"cloudwatch":   "CloudWatch: List AWS CloudWatch namespaces, metrics, dimensions, and log groups. Query execution is disabled.",
 	"cloudlogging": "Google Cloud Logging: List GCP projects, log buckets, and views. Query execution is disabled.",
-	"sql":          "SQL: List tables and describe table schemas in SQL datasources (ClickHouse, Snowflake, Athena, MySQL, PostgreSQL, MSSQL). Query execution is disabled.",
+	"sql":          "SQL: List tables and describe table schemas in SQL datasources (ClickHouse, Snowflake, Athena, MySQL, PostgreSQL, MSSQL, BigQuery). Query execution is disabled.",
 	"graphite":     "Graphite: List Graphite metrics and tags. Query execution is disabled.",
 }
 
@@ -199,9 +204,15 @@ type grafanaConfig struct {
 
 	maxLokiLogLimit int
 
-	lokiGuardrailMode     string
-	lokiGuardrailMaxBytes int64
-	lokiGuardrailMaxRange time.Duration
+	lokiGuardrailMode      string
+	lokiGuardrailMaxBytes  int64
+	lokiGuardrailMaxRange  time.Duration
+	lokiGuardrailOnFailure string
+
+	prometheusGuardrailRequireSelectiveLabels bool
+	prometheusGuardrailMode                   string
+	prometheusGuardrailMaxRange               time.Duration
+	prometheusGuardrailMaxPoints              int64
 
 	includeArgsInSpans bool
 
@@ -243,7 +254,7 @@ func (dt *disabledTools) addFlags() {
 	flag.BoolVar(&dt.cloudwatch, "disable-cloudwatch", false, "Disable CloudWatch tools")
 	flag.BoolVar(&dt.cloudlogging, "disable-cloudlogging", false, "Disable Google Cloud Logging tools")
 	flag.BoolVar(&dt.examples, "disable-examples", false, "Disable query examples tools")
-	flag.BoolVar(&dt.sql, "disable-sql", false, "Disable SQL tools (ClickHouse, Snowflake, Athena, MySQL, PostgreSQL, MSSQL)")
+	flag.BoolVar(&dt.sql, "disable-sql", false, "Disable SQL tools (ClickHouse, Snowflake, Athena, MySQL, PostgreSQL, MSSQL, BigQuery)")
 	flag.BoolVar(&dt.sql, "disable-clickhouse", false, "Deprecated: use --disable-sql instead")
 	flag.BoolVar(&dt.sql, "disable-snowflake", false, "Deprecated: use --disable-sql instead")
 	flag.BoolVar(&dt.sql, "disable-athena", false, "Deprecated: use --disable-sql instead")
@@ -272,9 +283,14 @@ func (gc *grafanaConfig) addFlags() {
 
 	flag.IntVar(&gc.maxLokiLogLimit, "max-loki-log-limit", tools.MaxLokiLogLimit, "Maximum number of log lines returned per query_loki_logs call")
 
-	flag.StringVar(&gc.lokiGuardrailMode, "loki-guardrail-mode", mcpgrafana.LokiGuardrailOff, "Loki query cost guardrail mode for query_loki_logs: 'off' (default), 'shadow' (evaluate and log queries that would be blocked, but let them run; still pays the index/stats round trip), or 'enforce' (reject blocked queries with rewrite guidance). Falls back to the GRAFANA_LOKI_GUARDRAIL_MODE environment variable when the flag is not set.")
-	flag.Int64Var(&gc.lokiGuardrailMaxBytes, "loki-guardrail-max-bytes", 100<<30, "Maximum bytes a single query_loki_logs call may scan, estimated via Loki's index/stats API before running the query. 0 disables the byte-budget check. Only applies when the guardrail is not 'off'. Falls back to the GRAFANA_LOKI_GUARDRAIL_MAX_BYTES environment variable when the flag is not set.")
-	flag.DurationVar(&gc.lokiGuardrailMaxRange, "loki-guardrail-max-range", 24*time.Hour, "Maximum effective time range for a single query_loki_logs call, including range-vector durations like [30d]. Accepts Go duration strings, e.g. 24h. 0 disables the range check. Only applies when the guardrail is not 'off'. Falls back to the GRAFANA_LOKI_GUARDRAIL_MAX_RANGE environment variable when the flag is not set.")
+	flag.StringVar(&gc.lokiGuardrailMode, "loki-guardrail-mode", mcpgrafana.LokiGuardrailOff, "Loki query cost guardrail mode for query_loki_logs and query_loki_patterns: 'off' (default), 'shadow' (evaluate and log queries that would be blocked, but let them run; still pays the index/stats round trip, including for queries a static check already blocks), or 'enforce' (reject blocked queries with rewrite guidance). Falls back to the GRAFANA_LOKI_GUARDRAIL_MODE environment variable when the flag is not set.")
+	flag.Int64Var(&gc.lokiGuardrailMaxBytes, "loki-guardrail-max-bytes", 100<<30, "Maximum bytes a single query_loki_logs call may scan, estimated via Loki's index/stats API before running the query (query_loki_patterns is checked for selector and time range only, since patterns are served by the pattern ingesters). 0 disables the byte-budget check. Only applies when the guardrail is not 'off'. Falls back to the GRAFANA_LOKI_GUARDRAIL_MAX_BYTES environment variable when the flag is not set.")
+	flag.StringVar(&gc.lokiGuardrailOnFailure, "loki-guardrail-on-estimate-failure", mcpgrafana.LokiGuardrailFailureAllow, "What the Loki guardrail does when it cannot assess a query (no stream selector it understands, or the index/stats estimate failed): 'allow' (default) runs the query, 'block' rejects it in enforce mode. Only applies when the guardrail is not 'off'. Falls back to the GRAFANA_LOKI_GUARDRAIL_ON_ESTIMATE_FAILURE environment variable when the flag is not set.")
+	flag.DurationVar(&gc.lokiGuardrailMaxRange, "loki-guardrail-max-range", 24*time.Hour, "Maximum effective time range for a single query_loki_logs or query_loki_patterns call, including range-vector durations like [30d]. Accepts Go duration strings, e.g. 24h. 0 disables the range check. Only applies when the guardrail is not 'off'. Falls back to the GRAFANA_LOKI_GUARDRAIL_MAX_RANGE environment variable when the flag is not set.")
+	flag.StringVar(&gc.prometheusGuardrailMode, "prometheus-guardrail-mode", mcpgrafana.PrometheusGuardrailOff, "Prometheus query guardrail mode for query_prometheus, query_prometheus_histogram and the Prometheus queries of run_panel_query: 'off' (default), 'shadow' (evaluate and log queries that would be blocked, but let them run), or 'enforce' (reject blocked queries with rewrite guidance). Falls back to the GRAFANA_PROMETHEUS_GUARDRAIL_MODE environment variable when the flag is not set.")
+	flag.BoolVar(&gc.prometheusGuardrailRequireSelectiveLabels, "prometheus-guardrail-require-selective-labels", false, "Require a non-empty positive label constraint beyond the metric name in each PromQL vector selector. Blanket regexes and negative matchers do not provide scope. Independent of range and points limits; only applies when the guardrail is not 'off'. Falls back to GRAFANA_PROMETHEUS_GUARDRAIL_REQUIRE_SELECTIVE_LABELS when the flag is not set.")
+	flag.DurationVar(&gc.prometheusGuardrailMaxRange, "prometheus-guardrail-max-range", 192*time.Hour, "Maximum effective time range for a single PromQL query: its time range plus the longest range vector or subquery window in the expression. Accepts Go duration strings, e.g. 192h. 0 disables the range check. Only applies when the guardrail is not 'off'. Falls back to the GRAFANA_PROMETHEUS_GUARDRAIL_MAX_RANGE environment variable when the flag is not set.")
+	flag.Int64Var(&gc.prometheusGuardrailMaxPoints, "prometheus-guardrail-max-points", 11000, "Maximum points per series a PromQL range query may request, computed from its time range and step. 0 disables the points check. Only applies when the guardrail is not 'off'. Falls back to the GRAFANA_PROMETHEUS_GUARDRAIL_MAX_POINTS environment variable when the flag is not set.")
 
 	flag.StringVar(&gc.lokiEnforcedMatchers, "loki-enforced-matchers", "", "LogQL label matchers AND-ed into every native-Loki query to restrict readable streams (e.g. `namespace!~\"vault|payments\"`). Queries that cannot be parsed are rejected. Requires --disable-api to be effective, otherwise it can be bypassed via the raw datasource proxy.")
 	flag.StringVar(&gc.lokiLabelEnumerationFallback, "loki-label-enumeration-fallback", tools.LabelEnumFallbackReject, "Behaviour of list_loki_label_names/list_loki_label_values when --loki-enforced-matchers cannot scope them (purely-negative matchers only): 'reject' (fail closed) or 'unfiltered' (allow unscoped enumeration of label metadata; never exposes log lines).")
@@ -333,12 +349,46 @@ func (gc *grafanaConfig) applyLokiGuardrailEnv(setFlags map[string]bool) error {
 		}
 		gc.lokiGuardrailMaxBytes = n
 	}
+	if v := os.Getenv("GRAFANA_LOKI_GUARDRAIL_ON_ESTIMATE_FAILURE"); v != "" && !setFlags["loki-guardrail-on-estimate-failure"] {
+		gc.lokiGuardrailOnFailure = v
+	}
 	if v := os.Getenv("GRAFANA_LOKI_GUARDRAIL_MAX_RANGE"); v != "" && !setFlags["loki-guardrail-max-range"] {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return fmt.Errorf("invalid GRAFANA_LOKI_GUARDRAIL_MAX_RANGE %q: %w", v, err)
 		}
 		gc.lokiGuardrailMaxRange = d
+	}
+	return nil
+}
+
+// applyPrometheusGuardrailEnv fills guardrail settings from
+// GRAFANA_PROMETHEUS_GUARDRAIL_* environment variables for flags not set on
+// the command line, with the same precedence as applyLokiGuardrailEnv.
+func (gc *grafanaConfig) applyPrometheusGuardrailEnv(setFlags map[string]bool) error {
+	if v := os.Getenv("GRAFANA_PROMETHEUS_GUARDRAIL_MODE"); v != "" && !setFlags["prometheus-guardrail-mode"] {
+		gc.prometheusGuardrailMode = v
+	}
+	if v := os.Getenv("GRAFANA_PROMETHEUS_GUARDRAIL_MAX_RANGE"); v != "" && !setFlags["prometheus-guardrail-max-range"] {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid GRAFANA_PROMETHEUS_GUARDRAIL_MAX_RANGE %q: %w", v, err)
+		}
+		gc.prometheusGuardrailMaxRange = d
+	}
+	if v := os.Getenv("GRAFANA_PROMETHEUS_GUARDRAIL_MAX_POINTS"); v != "" && !setFlags["prometheus-guardrail-max-points"] {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid GRAFANA_PROMETHEUS_GUARDRAIL_MAX_POINTS %q: %w", v, err)
+		}
+		gc.prometheusGuardrailMaxPoints = n
+	}
+	if v := os.Getenv("GRAFANA_PROMETHEUS_GUARDRAIL_REQUIRE_SELECTIVE_LABELS"); v != "" && !setFlags["prometheus-guardrail-require-selective-labels"] {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid GRAFANA_PROMETHEUS_GUARDRAIL_REQUIRE_SELECTIVE_LABELS %q: %w", v, err)
+		}
+		gc.prometheusGuardrailRequireSelectiveLabels = b
 	}
 	return nil
 }
@@ -360,11 +410,31 @@ func (gc *grafanaConfig) validateLokiGuardrail() error {
 	default:
 		return fmt.Errorf("invalid Loki guardrail mode %q (--loki-guardrail-mode or GRAFANA_LOKI_GUARDRAIL_MODE): must be one of off, shadow, enforce", gc.lokiGuardrailMode)
 	}
+	switch gc.lokiGuardrailOnFailure {
+	case "", mcpgrafana.LokiGuardrailFailureAllow, mcpgrafana.LokiGuardrailFailureBlock:
+	default:
+		return fmt.Errorf("invalid Loki guardrail estimate-failure behaviour %q (--loki-guardrail-on-estimate-failure or GRAFANA_LOKI_GUARDRAIL_ON_ESTIMATE_FAILURE): must be one of allow, block", gc.lokiGuardrailOnFailure)
+	}
 	if gc.lokiGuardrailMaxBytes < 0 {
 		return fmt.Errorf("invalid Loki guardrail max bytes %d (--loki-guardrail-max-bytes or GRAFANA_LOKI_GUARDRAIL_MAX_BYTES): must be >= 0 (0 disables the byte-budget check)", gc.lokiGuardrailMaxBytes)
 	}
 	if gc.lokiGuardrailMaxRange < 0 {
 		return fmt.Errorf("invalid Loki guardrail max range %s (--loki-guardrail-max-range or GRAFANA_LOKI_GUARDRAIL_MAX_RANGE): must be >= 0 (0 disables the range check)", gc.lokiGuardrailMaxRange)
+	}
+	return nil
+}
+
+func (gc *grafanaConfig) validatePrometheusGuardrail() error {
+	switch gc.prometheusGuardrailMode {
+	case mcpgrafana.PrometheusGuardrailOff, mcpgrafana.PrometheusGuardrailShadow, mcpgrafana.PrometheusGuardrailEnforce:
+	default:
+		return fmt.Errorf("invalid Prometheus guardrail mode %q (--prometheus-guardrail-mode or GRAFANA_PROMETHEUS_GUARDRAIL_MODE): must be one of off, shadow, enforce", gc.prometheusGuardrailMode)
+	}
+	if gc.prometheusGuardrailMaxRange < 0 {
+		return fmt.Errorf("invalid Prometheus guardrail max range %s (--prometheus-guardrail-max-range or GRAFANA_PROMETHEUS_GUARDRAIL_MAX_RANGE): must be >= 0 (0 disables the range check)", gc.prometheusGuardrailMaxRange)
+	}
+	if gc.prometheusGuardrailMaxPoints < 0 {
+		return fmt.Errorf("invalid Prometheus guardrail max points %d (--prometheus-guardrail-max-points or GRAFANA_PROMETHEUS_GUARDRAIL_MAX_POINTS): must be >= 0 (0 disables the points check)", gc.prometheusGuardrailMaxPoints)
 	}
 	return nil
 }
@@ -387,7 +457,9 @@ func (dt *disabledTools) toolEntries() []toolEntry {
 		{func(s *mcp.Server) { tools.AddElasticsearchTools(s, enableQueryTools) }, dt.elasticsearch, "elasticsearch"},
 		{func(s *mcp.Server) { tools.AddQuickwitTools(s, enableQueryTools) }, dt.quickwit, "quickwit"},
 		{func(s *mcp.Server) { tools.AddInfluxDBTools(s, dt.queryToolsEnabled("influxdb")) }, dt.influxdb, "influxdb"},
-		{func(s *mcp.Server) { tools.AddAlertingTools(s, enableWriteTools) }, dt.alerting, "alerting"},
+		{func(s *mcp.Server) {
+			tools.AddAlertingTools(s, func(name string) bool { return dt.writeToolEnabled(name) })
+		}, dt.alerting, "alerting"},
 		{func(s *mcp.Server) { tools.AddDashboardTools(s, enableWriteTools) }, dt.dashboard, "dashboard"},
 		{func(s *mcp.Server) { tools.AddFolderTools(s, enableWriteTools) }, dt.folder, "folder"},
 		{func(s *mcp.Server) { tools.AddOnCallTools(s, enableWriteTools) }, dt.oncall, "oncall"},
@@ -397,7 +469,7 @@ func (dt *disabledTools) toolEntries() []toolEntry {
 		{func(s *mcp.Server) { tools.AddNavigationTools(s, dt.deeplinkShorteningEnabled()) }, dt.navigation, "navigation"},
 		{func(s *mcp.Server) { tools.AddTempoTools(s, enableQueryTools) }, dt.tempo, "tempo"},
 		{func(s *mcp.Server) { tools.AddAnnotationTools(s, enableWriteTools) }, dt.annotations, "annotations"},
-		{tools.AddRenderingTools, dt.rendering, "rendering"},
+		{func(s *mcp.Server) { tools.AddRenderingTools(s, dt.appSources()...) }, dt.rendering, "rendering"},
 		{func(s *mcp.Server) { tools.AddSnapshotTools(s, enableWriteTools) }, dt.snapshot, "snapshot"},
 		{func(s *mcp.Server) { tools.AddCloudWatchTools(s, enableQueryTools) }, dt.cloudwatch, "cloudwatch"},
 		{func(s *mcp.Server) { tools.AddCloudLoggingTools(s, enableQueryTools) }, dt.cloudlogging, "cloudlogging"},
@@ -414,6 +486,36 @@ func (dt *disabledTools) toolEntries() []toolEntry {
 		{tools.AddDocsTools, dt.docs, "docs"},
 		{tools.AddUserTools, dt.user, "user"},
 	}
+}
+
+func (dt *disabledTools) appSources() []mcpgrafana.Tool {
+	if dt.query {
+		return nil
+	}
+	enabled := strings.Split(dt.enabledTools, ",")
+	var sources []mcpgrafana.Tool
+	if isCategoryEnabled(enabled, dt.prometheus, "prometheus") {
+		sources = append(sources, tools.QueryPrometheus)
+	}
+	if isCategoryEnabled(enabled, dt.tempo, "tempo") {
+		sources = append(sources, tools.GetTempoTraceTool)
+	}
+	return sources
+}
+
+// resourceKinds returns the MCP resource kinds to serve: each follows its
+// tool category.
+func (dt *disabledTools) resourceKinds() []resources.Kind {
+	dt.normalizeEnabledTools()
+	enabled := strings.Split(dt.enabledTools, ",")
+	var kinds []resources.Kind
+	if isCategoryEnabled(enabled, dt.datasource, "datasource") {
+		kinds = append(kinds, resources.Datasources)
+	}
+	if isCategoryEnabled(enabled, dt.incident, "incident") {
+		kinds = append(kinds, resources.ActiveIncidents)
+	}
+	return kinds
 }
 
 // categoryReport lists the tool categories that are actually active and the
@@ -573,15 +675,31 @@ func appendInstructions(base, extra string) string {
 	return base
 }
 
-func newServer(serverName string, dt disabledTools, obs *observability.Observability, usage *usagestats.Reporter, instructionsAppend string) *mcp.Server {
+// sseKeepAliveFailureThreshold is how many keepalive pings in a row a client
+// may miss before its session is closed. go-sdk closes on the first miss by
+// default, so one slow reply would end a session the pings exist to keep.
+const sseKeepAliveFailureThreshold = 3
+
+// minSSEKeepAlive is the shortest --sse-keepalive accepted. Each ping must be
+// answered within half the interval, so a tiny value (a typo like 1ms)
+// would disconnect clients almost at once.
+const minSSEKeepAlive = time.Second
+
+// keepAlive is the interval between pings the server sends to each connected
+// client; 0 disables them. run() passes a non-zero value only for the SSE
+// transport (see effectiveSSEKeepAlive).
+func newServer(serverName string, dt disabledTools, obs *observability.Observability, usage *usagestats.Reporter, instructionsAppend string, keepAlive time.Duration) *mcp.Server {
 	instructions := appendInstructions(dt.buildInstructions(), instructionsAppend)
 
 	s := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: mcpgrafana.Version()}, &mcp.ServerOptions{
-		Instructions: instructions,
+		Instructions:              instructions,
+		KeepAlive:                 keepAlive,
+		KeepAliveFailureThreshold: sseKeepAliveFailureThreshold,
 	})
 
 	dt.processTools(s)
 	mcpgrafana.RegisterAppResources(s)
+	resources.Register(s, dt.resourceKinds()...)
 
 	s.AddReceivingMiddleware(obs.MCPMiddleware())
 	s.AddReceivingMiddleware(usage.MCPMiddleware())
@@ -727,10 +845,17 @@ func withCallerAuth(token string, h http.Handler) http.Handler {
 	return mcpgrafana.RequireBearerToken(token, slog.Default())(h)
 }
 
-func (hsc httpSecurityConfig) policy(address string) mcpgrafana.HostOriginPolicy {
+func (hsc httpSecurityConfig) policy(addresses ...string) mcpgrafana.HostOriginPolicy {
 	hosts := splitAndTrim(hsc.allowedHosts)
 	if len(hosts) == 0 {
-		hosts = mcpgrafana.DefaultAllowedHosts(address)
+		for _, address := range addresses {
+			candidates := append([]string{strings.ToLower(address)}, mcpgrafana.DefaultAllowedHosts(address)...)
+			for _, host := range candidates {
+				if !slices.Contains(hosts, host) {
+					hosts = append(hosts, host)
+				}
+			}
+		}
 	}
 	return mcpgrafana.HostOriginPolicy{
 		AllowedHosts:   hosts,
@@ -834,17 +959,23 @@ func isBenignStdioClose(err error) bool {
 	return errors.Is(err, mcp.ErrConnectionClosed)
 }
 
-// runHTTPServer starts an *http.Server and blocks until ctx is cancelled or
-// the server returns an error. When tlsCert is non-empty, it uses TLS. On
-// context cancellation it performs a graceful shutdown with a 5-second deadline.
-func runHTTPServer(ctx context.Context, srv *http.Server, transportName, tlsCert, tlsKey string) error {
+// runHTTPServer starts an *http.Server on an already-bound listener and blocks
+// until ctx is cancelled or the server returns an error. On cancellation it
+// performs a graceful shutdown with a 5-second deadline.
+func runHTTPServer(
+	ctx context.Context,
+	srv *http.Server,
+	listener net.Listener,
+	transportName string,
+	tls tlsConfig,
+) error {
 	serverErr := make(chan error, 1)
 	go func() {
 		var err error
-		if tlsCert != "" {
-			err = srv.ListenAndServeTLS(tlsCert, tlsKey)
+		if tls.certFile != "" {
+			err = srv.ServeTLS(listener, tls.certFile, tls.keyFile)
 		} else {
-			err = srv.ListenAndServe()
+			err = srv.Serve(listener)
 		}
 		if err != nil && err != http.ErrServerClosed {
 			serverErr <- err
@@ -861,6 +992,55 @@ func runHTTPServer(ctx context.Context, srv *http.Server, transportName, tlsCert
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	}
+}
+
+func listenHTTP(address string) (net.Listener, error) {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %q: %w", address, err)
+	}
+	if _, port, splitErr := net.SplitHostPort(address); splitErr == nil && port == "0" {
+		if err := writeBoundAddress(dynamicAddressFileName, listener.Addr().String()); err != nil {
+			_ = listener.Close()
+			return nil, err
+		}
+	}
+	return listener, nil
+}
+
+func addressWithBoundPort(address, boundAddress string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return boundAddress
+	}
+	_, port, err := net.SplitHostPort(boundAddress)
+	if err != nil {
+		return boundAddress
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func writeBoundAddress(path, address string) error {
+	if path == "" {
+		return nil
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create address file beside %q: %w", path, err)
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if _, err := temporary.WriteString(address + "\n"); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("write bound address to %q: %w", temporaryPath, err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close bound address file %q: %w", temporaryPath, err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("publish bound address file %q: %w", path, err)
+	}
+	return nil
 }
 
 func handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -936,6 +1116,28 @@ func effectiveTLSEnabled(transport string, tls tlsConfig) bool {
 // called from the HTTP branches, so no route exists to scrape.
 func effectiveMetricsEnabled(transport string, metricsEnabled bool) bool {
 	return metricsEnabled && transport != "stdio"
+}
+
+// validateSSEKeepAlive rejects a negative --sse-keepalive, or one below
+// minSSEKeepAlive. 0 disables pings.
+func validateSSEKeepAlive(interval time.Duration) error {
+	if interval < 0 {
+		return fmt.Errorf("invalid --sse-keepalive %s: must be >= 0 (0 disables keepalive pings)", interval)
+	}
+	if interval > 0 && interval < minSSEKeepAlive {
+		return fmt.Errorf("invalid --sse-keepalive %s: must be 0 (disabled) or at least %s", interval, minSSEKeepAlive)
+	}
+	return nil
+}
+
+// effectiveSSEKeepAlive returns the ping interval the MCP server is built with.
+// Pings exist to stop reverse proxies from closing the SSE transport's idle
+// event stream, which deletes the session, so other transports ignore the flag.
+func effectiveSSEKeepAlive(transport string, interval time.Duration) time.Duration {
+	if transport != "sse" {
+		return 0
+	}
+	return interval
 }
 
 // nativeToolNames is the set of tool names the server registered itself. It
@@ -1115,7 +1317,7 @@ func validateMountFlags(transport, basePath, endpointPath, healthzAddress string
 	return nil
 }
 
-func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt disabledTools, gc mcpgrafana.GrafanaConfig, tls tlsConfig, hsc httpSecurityConfig, ca callerAuthConfig, obs observability.Config, us usagestats.Config, healthzAddress, instructionsAppend string) error {
+func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt disabledTools, gc mcpgrafana.GrafanaConfig, tls tlsConfig, hsc httpSecurityConfig, ca callerAuthConfig, obs observability.Config, us usagestats.Config, healthzAddress, instructionsAppend string, sseKeepAlive time.Duration) error {
 	// --base-path feeds every mux pattern, so normalize it once here and let
 	// every mux mount read the same value. main() has already rejected values
 	// these mounts could not serve.
@@ -1187,7 +1389,11 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 	usage := usagestats.New(us)
 	usage.Disclose()
 
-	s := newServer(obs.ServerName, dt, o, usage, instructionsAppend)
+	keepAlive := effectiveSSEKeepAlive(transport, sseKeepAlive)
+	if keepAlive != sseKeepAlive {
+		slog.Warn("--sse-keepalive only applies to the SSE transport; ignoring it", "transport", transport)
+	}
+	s := newServer(obs.ServerName, dt, o, usage, instructionsAppend, keepAlive)
 	usage.SetNativeTools(nativeToolNames(dt))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1218,12 +1424,24 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 		} else {
 			checkCallerAuthPolicy(transport, addr, callerToken, slog.Default())
 		}
+		mcpgrafana.WarnIfOrgIDUnset(slog.Default())
 		if gc.AllowGrafanaURLOverride && len(gc.AllowedGrafanaURLs) == 0 {
 			slog.Error("SECURITY: unrestricted Grafana URL overrides are enabled. Every MCP caller can make requests to arbitrary HTTP(S) targets reachable by this server, including internal services. Use an authenticating proxy that authorizes targets and supplies matching tokens, and restrict outbound network access. An allowlist alone is not a substitute for these controls.")
 		}
 		if callerToken != "" && mcpgrafana.ForwardsAuthorizationHeader() {
 			return fmt.Errorf("refusing to start: caller authentication is enabled (--server-auth-token / %s) while GRAFANA_FORWARD_HEADERS forwards the Authorization header. Authorization is reserved for MCP caller authentication and would leak to Grafana. Remove Authorization from GRAFANA_FORWARD_HEADERS, or unset the caller token to run in proxy-forwarding mode", serverAuthTokenEnvVar)
 		}
+	}
+
+	var listener net.Listener
+	boundAddress := addr
+	if transport == "sse" || transport == "streamable-http" {
+		listener, err = listenHTTP(addr)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = listener.Close() }()
+		boundAddress = listener.Addr().String()
 	}
 
 	disableLocalhostProtection := len(splitAndTrim(hsc.allowedHosts)) > 0
@@ -1283,16 +1501,17 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 		runOpsServers(registerOps(mux, o, healthzAddress, obs))
 
 		httpSrv := &http.Server{
-			Addr:    addr,
-			Handler: mcpgrafana.DNSRebindingProtectionMiddleware(hsc.policy(addr))(mux),
+			Handler: mcpgrafana.DNSRebindingProtectionMiddleware(
+				hsc.policy(boundAddress, addressWithBoundPort(addr, boundAddress)),
+			)(mux),
 			// Derive HTTP request contexts from the cancellable ctx so that
 			// SIGTERM cancels long-lived SSE streams and Shutdown completes
 			// within its deadline instead of blocking on open connections.
 			BaseContext: func(_ net.Listener) context.Context { return ctx },
 		}
 		slog.Info("Starting Grafana MCP server using SSE transport",
-			"version", mcpgrafana.Version(), "address", addr, "ssePath", ssePath, "metrics", obs.MetricsEnabled)
-		return runHTTPServer(ctx, httpSrv, "SSE", tls.certFile, tls.keyFile)
+			"version", mcpgrafana.Version(), "address", boundAddress, "ssePath", ssePath, "keepAlive", keepAlive, "metrics", obs.MetricsEnabled)
+		return runHTTPServer(ctx, httpSrv, listener, "SSE", tls)
 
 	case "streamable-http":
 		httpFn := mcpgrafana.ComposedHTTPContextFunc(gc, clientCache)
@@ -1327,13 +1546,14 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 		runOpsServers(registerOps(mux, o, healthzAddress, obs))
 
 		httpSrv := &http.Server{
-			Addr:        addr,
-			Handler:     mcpgrafana.DNSRebindingProtectionMiddleware(hsc.policy(addr))(mux),
+			Handler: mcpgrafana.DNSRebindingProtectionMiddleware(
+				hsc.policy(boundAddress, addressWithBoundPort(addr, boundAddress)),
+			)(mux),
 			BaseContext: func(_ net.Listener) context.Context { return ctx },
 		}
 		slog.Info("Starting Grafana MCP server using StreamableHTTP transport",
-			"version", mcpgrafana.Version(), "address", addr, "endpointPath", mcpEndpoint, "metrics", obs.MetricsEnabled)
-		return runHTTPServer(ctx, httpSrv, "StreamableHTTP", tls.certFile, tls.keyFile)
+			"version", mcpgrafana.Version(), "address", boundAddress, "endpointPath", mcpEndpoint, "metrics", obs.MetricsEnabled)
+		return runHTTPServer(ctx, httpSrv, listener, "StreamableHTTP", tls)
 
 	default:
 		return fmt.Errorf("invalid transport type: %s. Must be 'stdio', 'sse' or 'streamable-http'", transport)
@@ -1354,6 +1574,7 @@ func main() {
 	addr := flag.String("address", "localhost:8000", "The host and port to start the sse server on")
 	basePath := flag.String("base-path", "", "Base path for the sse or streamable-http server. /healthz and /metrics are always served at the root, not under this prefix")
 	endpointPath := flag.String("endpoint-path", "/mcp", "Endpoint path for the streamable-http server, appended to --base-path")
+	sseKeepAlive := flag.Duration("sse-keepalive", 0, "Interval between ping requests sent to each SSE client, so reverse proxies and load balancers do not close an idle event stream (and the session with it). Set it below the proxy's idle timeout, e.g. 30s behind ingress-nginx's default 60s proxy-read-timeout. A client is disconnected after 3 pings in a row go unanswered for half the interval each. Accepts Go duration strings, minimum 1s. 0 (the default) disables pings. Only applies to --transport sse.")
 	_ = flag.Int("session-idle-timeout-minutes", 30, "Deprecated: the official go-sdk manages sessions internally. This flag is ignored.")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	showVersion := flag.Bool("version", false, "Print the version and exit")
@@ -1429,6 +1650,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
+	if err := gc.applyPrometheusGuardrailEnv(setFlags); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	if err := gc.applyGrafanaURLOverrideEnv(setFlags); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
@@ -1442,10 +1667,21 @@ func main() {
 		os.Exit(2)
 	}
 	if gc.lokiGuardrailMode != mcpgrafana.LokiGuardrailOff {
-		slog.Info("Loki guardrail enabled", "mode", gc.lokiGuardrailMode, "max_bytes", gc.lokiGuardrailMaxBytes, "max_range", gc.lokiGuardrailMaxRange)
+		slog.Info("Loki guardrail enabled", "mode", gc.lokiGuardrailMode, "max_bytes", gc.lokiGuardrailMaxBytes, "max_range", gc.lokiGuardrailMaxRange, "on_estimate_failure", gc.lokiGuardrailOnFailure)
+	}
+	if err := gc.validatePrometheusGuardrail(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if gc.prometheusGuardrailMode != mcpgrafana.PrometheusGuardrailOff {
+		slog.Info("Prometheus guardrail enabled", "mode", gc.prometheusGuardrailMode, "max_range", gc.prometheusGuardrailMaxRange, "max_points", gc.prometheusGuardrailMaxPoints, "require_selective_labels", gc.prometheusGuardrailRequireSelectiveLabels)
 	}
 
 	if err := validateMountFlags(transport, *basePath, *endpointPath, *healthzAddress, obs); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if err := validateSSEKeepAlive(*sseKeepAlive); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
@@ -1459,16 +1695,21 @@ func main() {
 	mcpgrafana.DynamicMultiOrgEnabled = gc.dynamicMultiOrg
 
 	grafanaConfig := mcpgrafana.GrafanaConfig{
-		Debug:                     gc.debug,
-		AllowGrafanaURLOverride:   gc.allowURLOverride,
-		AllowCrossOriginRedirects: gc.allowCrossOriginRedirects,
-		MaxLokiLogLimit:           gc.maxLokiLogLimit,
-		LokiGuardrailMode:         gc.lokiGuardrailMode,
-		LokiGuardrailMaxBytes:     gc.lokiGuardrailMaxBytes,
-		LokiGuardrailMaxRange:     gc.lokiGuardrailMaxRange,
-		IncludeArgumentsInSpans:   gc.includeArgsInSpans,
-		Timeout:                   gc.timeout,
-		SOCKS5ProxyURL:            socks5Proxy,
+		Debug:                                     gc.debug,
+		AllowGrafanaURLOverride:                   gc.allowURLOverride,
+		AllowCrossOriginRedirects:                 gc.allowCrossOriginRedirects,
+		MaxLokiLogLimit:                           gc.maxLokiLogLimit,
+		LokiGuardrailMode:                         gc.lokiGuardrailMode,
+		LokiGuardrailMaxBytes:                     gc.lokiGuardrailMaxBytes,
+		LokiGuardrailMaxRange:                     gc.lokiGuardrailMaxRange,
+		LokiGuardrailOnEstimateFailure:            gc.lokiGuardrailOnFailure,
+		PrometheusGuardrailRequireSelectiveLabels: gc.prometheusGuardrailRequireSelectiveLabels,
+		PrometheusGuardrailMode:                   gc.prometheusGuardrailMode,
+		PrometheusGuardrailMaxRange:               gc.prometheusGuardrailMaxRange,
+		PrometheusGuardrailMaxPoints:              gc.prometheusGuardrailMaxPoints,
+		IncludeArgumentsInSpans:                   gc.includeArgsInSpans,
+		Timeout:                                   gc.timeout,
+		SOCKS5ProxyURL:                            socks5Proxy,
 	}
 	grafanaConfig.AllowedGrafanaURLs, err = mcpgrafana.ParseGrafanaURLOverrides(gc.allowedURLs)
 	if err != nil {
@@ -1520,7 +1761,7 @@ func main() {
 		level = slog.LevelDebug
 	}
 
-	if err := run(transport, *addr, *basePath, *endpointPath, level, dt, grafanaConfig, tls, hsc, ca, obs, usageStats, *healthzAddress, *instructionsAppend); err != nil {
+	if err := run(transport, *addr, *basePath, *endpointPath, level, dt, grafanaConfig, tls, hsc, ca, obs, usageStats, *healthzAddress, *instructionsAppend, *sseKeepAlive); err != nil {
 		slog.Error("Fatal error", "error", err)
 		os.Exit(1)
 	}
