@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
@@ -766,11 +767,40 @@ func (hsc *httpSecurityConfig) addFlags() {
 const serverAuthTokenEnvVar = "MCP_GRAFANA_SERVER_TOKEN"
 
 type callerAuthConfig struct {
-	token string
+	token             string
+	workosAuthkit     string
+	workosResource    string
+	workosEmailDomain string
 }
 
 func (ca *callerAuthConfig) addFlags() {
 	flag.StringVar(&ca.token, "server-auth-token", "", "Bearer token that callers must present in the Authorization header to use the HTTP/SSE transports. Falls back to the "+serverAuthTokenEnvVar+" environment variable. When set, unauthenticated requests are rejected with 401. Has no effect on the stdio transport.")
+	flag.StringVar(&ca.workosAuthkit, "workos-authkit-domain", "", "HTTPS AuthKit origin for native WorkOS Connect authentication (streamable-http only)")
+	flag.StringVar(&ca.workosResource, "workos-resource-url", "", "Exact public HTTPS MCP endpoint URL configured as a WorkOS Resource Indicator")
+	flag.StringVar(&ca.workosEmailDomain, "workos-allowed-email-domain", "", "Exact domain whose verified WorkOS users may access the configured Grafana")
+}
+
+func (ca callerAuthConfig) workOS(transport, endpoint string, gc mcpgrafana.GrafanaConfig) (*mcpgrafana.WorkOSAuth, error) {
+	if ca.workosAuthkit == "" && ca.workosResource == "" && ca.workosEmailDomain == "" {
+		return nil, nil
+	}
+	if ca.workosAuthkit == "" || ca.workosResource == "" || ca.workosEmailDomain == "" {
+		return nil, fmt.Errorf("all three --workos-* authentication flags are required together")
+	}
+	if transport != "streamable-http" {
+		return nil, fmt.Errorf("WorkOS authentication requires --transport=streamable-http")
+	}
+	if ca.resolveToken() != "" {
+		return nil, fmt.Errorf("WorkOS authentication cannot be combined with --server-auth-token or %s", serverAuthTokenEnvVar)
+	}
+	if gc.AllowGrafanaURLOverride || len(gc.AllowedGrafanaURLs) > 0 || mcpgrafana.DynamicMultiOrgEnabled {
+		return nil, fmt.Errorf("WorkOS authentication requires one fixed Grafana target and organization")
+	}
+	u, err := url.Parse(ca.workosResource)
+	if err != nil || u.Path != endpoint {
+		return nil, fmt.Errorf("workos-resource-url path must match the configured MCP endpoint")
+	}
+	return mcpgrafana.NewWorkOSAuth(ca.workosAuthkit, ca.workosResource, ca.workosEmailDomain)
 }
 
 func (ca callerAuthConfig) resolveToken() string {
@@ -1296,6 +1326,10 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 	if err := validateGrafanaURLOverridePolicy(transport, gc); err != nil {
 		return err
 	}
+	workosAuth, err := ca.workOS(transport, streamableEndpointPath(basePath, endpointPath), gc)
+	if err != nil {
+		return err
+	}
 
 	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
 	slog.SetDefault(slog.New(stderrHandler))
@@ -1385,7 +1419,11 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 	}()
 
 	if transport == "sse" || transport == "streamable-http" {
-		checkCallerAuthPolicy(transport, addr, callerToken, slog.Default())
+		if workosAuth != nil {
+			slog.Info("WorkOS caller authentication enabled", "transport", transport)
+		} else {
+			checkCallerAuthPolicy(transport, addr, callerToken, slog.Default())
+		}
 		mcpgrafana.WarnIfOrgIDUnset(slog.Default())
 		if gc.AllowGrafanaURLOverride && len(gc.AllowedGrafanaURLs) == 0 {
 			slog.Error("SECURITY: unrestricted Grafana URL overrides are enabled. Every MCP caller can make requests to arbitrary HTTP(S) targets reachable by this server, including internal services. Use an authenticating proxy that authorizes targets and supplies matching tokens, and restrict outbound network access. An allowlist alone is not a substitute for these controls.")
@@ -1492,12 +1530,19 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 		// --base-path is documented for this transport too, so fold it into the
 		// endpoint the server listens on.
 		mcpEndpoint := streamableEndpointPath(basePath, endpointPath)
+		handler := mcpgrafana.GrafanaURLOverrideMiddleware(gc.AllowGrafanaURLOverride, gc.AllowedGrafanaURLs, streamHandler)
+		if workosAuth != nil {
+			handler = workosAuth.Middleware(handler)
+		}
 		mux := newStreamableHTTPMux(
-			mcpgrafana.GrafanaURLOverrideMiddleware(gc.AllowGrafanaURLOverride, gc.AllowedGrafanaURLs, streamHandler),
+			handler,
 			mcpEndpoint,
 			callerToken,
 			hsc.corsOrigins(),
 		)
+		if workosAuth != nil {
+			workosAuth.RegisterRoutes(mux)
+		}
 		runOpsServers(registerOps(mux, o, healthzAddress, obs))
 
 		httpSrv := &http.Server{

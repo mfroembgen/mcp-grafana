@@ -62,6 +62,26 @@ For HTTP deployments that [select a Grafana URL per request](../command-line-fla
 
 You can use basic auth by setting `GRAFANA_USERNAME` and `GRAFANA_PASSWORD` instead of a token. This is less suitable for automation; prefer a service account token when possible.
 
+## Authenticate MCP callers with WorkOS
+
+Streamable HTTP can use [WorkOS AuthKit and Connect](https://workos.com/docs/authkit/mcp) for browser sign-in, consent and token refresh. This authenticates callers separately from the fixed Grafana credentials above. Use a Grafana Viewer service account with `--disable-write` for read-only access.
+
+Configure the exact public MCP endpoint as a WorkOS Resource Indicator, enable CIMD and DCR for your MCP clients, and configure your sign-in provider in WorkOS. Then start the server with all three flags:
+
+```bash
+mcp-grafana --transport=streamable-http --disable-write \
+  --allowed-hosts=mcp.example.com \
+  --workos-authkit-domain=https://auth.example.com \
+  --workos-resource-url=https://mcp.example.com/mcp \
+  --workos-allowed-email-domain=example.com
+```
+
+Terminate TLS at the ingress or use the server TLS flags. The resource URL's path must match the configured MCP endpoint, including any `--base-path`. MCP clients connect to that URL and discover WorkOS automatically; the server needs no WorkOS API key or client secret.
+
+Only RS256 Connect user grants for that exact issuer and resource are accepted. The server requires `openid` and `email`, then checks WorkOS userinfo using the same token: the subject must match, the email must be verified, and its domain must match the configured domain exactly. Profile responses are not cached. Existing grants remain subject to WorkOS expiry and revocation; suspending an upstream identity does not by itself revoke every existing grant.
+
+WorkOS mode rejects partial configuration, static caller tokens, SSE/stdio, URL overrides, dynamic multi-org, and caller-header forwarding with `GRAFANA_FORWARD_HEADERS`. It strips caller credentials and all `X-Grafana-*` headers before tool execution, so callers use the server's configured Grafana identity. Without WorkOS flags, existing static-token and stdio behavior is unchanged.
+
 ## Next steps
 
 - [Enable and disable tools](../enable-and-disable-tools/) to control which MCP tools are available.
