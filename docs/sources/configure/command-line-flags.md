@@ -49,19 +49,20 @@ When deploying behind an ingress or reverse proxy that forwards the original `Ho
 The SSE and streamable-http transports can authenticate the **caller** (the MCP client connecting to `mcp-grafana`). This is separate from the credentials the server uses to reach Grafana: it controls _who may invoke the server_, so an unauthenticated client can't borrow the server's Grafana identity or run tools. Stdio is a local pipe and is never affected.
 
 - `--server-auth-token`: Bearer token that callers must present in the `Authorization: Bearer <token>` header. Falls back to the `MCP_GRAFANA_SERVER_TOKEN` environment variable. When set, requests without a valid token are rejected with `401` before any tool runs. Prefer the environment variable over the flag so the secret doesn't appear in the process argument list.
+- `--workos-authkit-domain`, `--workos-resource-url`, `--workos-allowed-email-domain`: Enable native WorkOS Connect authentication for streamable HTTP. All three are required together and cannot be combined with a static caller token. See [WorkOS caller authentication](../authentication/#authenticate-mcp-callers-with-workos) for setup and fixed-Grafana restrictions.
 
 ### Bind policy
 
-Caller authentication is enforced only when `--server-auth-token` is set. When it isn't, the network transports warn (but still start) on an externally reachable address:
+Caller authentication is enforced when `--server-auth-token` or complete WorkOS authentication is configured. Otherwise, the network transports warn (but still start) on an externally reachable address:
 
 | Transport / bind | Behavior |
 | --- | --- |
 | `stdio` | No caller authentication (local pipe). |
 | SSE / streamable-http on a loopback address (`localhost`, `127.0.0.1`, `::1`) | Caller token optional. |
-| SSE / streamable-http on any other address | Starts and logs a **security error** (at the `error` log level, so it isn't suppressed by `--log-level`) unless `--server-auth-token` is set. |
+| SSE / streamable-http on any other address | Starts and logs a **security error** (at the `error` log level, so it isn't suppressed by `--log-level`) unless a caller token or complete WorkOS authentication is configured. |
 
 {{< admonition type="note" >}}
-The permissive default preserves backward compatibility for existing deployments (such as the container's `0.0.0.0` bind). A future major release will make an unauthenticated non-loopback bind a startup error. Set `--server-auth-token` now to require caller authentication and prepare for that change.
+The permissive default preserves backward compatibility for existing deployments (such as the container's `0.0.0.0` bind). A future major release will make an unauthenticated non-loopback bind a startup error. Configure a caller token or native WorkOS authentication to prepare for that change.
 {{< /admonition >}}
 
 Bearer authentication only protects the token in transit if the connection is encrypted. Terminate TLS in front of the server, or use [server TLS for streamable-http](../server-tls-streamable-http/), whenever you set `--server-auth-token` on a non-loopback address.
