@@ -134,7 +134,7 @@ var categoryDescriptionNoWrite = map[string]string{
 	"oncall":      "OnCall: View on-call schedules, shifts, teams, users, and alert groups.",
 	"annotations": "Annotations: Fetch dashboard annotations and their tags.",
 	"snapshot":    "Snapshots: List and get dashboard snapshots.",
-	"api":         "API: Make read-only HTTP requests to any Grafana API endpoint with optional jq-style response filtering.",
+	"api":         "API: Make GET requests to any Grafana API endpoint with optional jq-style response filtering.",
 	"agento11y":   "Agent Observability: Search and inspect LLM conversations, generations, and evaluation scores from Grafana Agent Observability. Read its agent catalog (system prompts, tools, version history, and per-version scores), its eval configuration (evaluators, templates, eval rules, and guards), its curated saved conversations and collections, its offline experiments with their trials and scores, and the versioned test suites those experiments run against.",
 }
 
