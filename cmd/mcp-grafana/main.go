@@ -192,6 +192,9 @@ type disabledTools struct {
 
 	writeToolOverrides string
 
+	// instructions sends no server instructions (--disable-instructions).
+	instructions bool
+
 	search, datasource, incident,
 	prometheus, loki, elasticsearch, quickwit, influxdb, alerting,
 	dashboard, folder, oncall, asserts, admin,
@@ -258,6 +261,7 @@ func (dt *disabledTools) addFlags() {
 	flag.BoolVar(&dt.tempo, "disable-tempo", false, "Disable Tempo tracing tools")
 	flag.BoolVar(&dt.tempo, "disable-proxied", false, "Deprecated: use --disable-tempo instead")
 	flag.BoolVar(&dt.write, "disable-write", false, "Disable write tools (create/update operations)")
+	flag.BoolVar(&dt.instructions, "disable-instructions", false, "Send no server instructions, including --instructions-append, for example from all but one of several servers that the same agent connects")
 	flag.BoolVar(&dt.query, "disable-query", false, "Disable query tools (tools that execute a query against a datasource, e.g. query_prometheus, query_loki_logs, run_panel_query). Metadata and discovery tools stay available.")
 	flag.BoolVar(&dt.enableQuery, "enable-query", false, "Keep the raw-SQL query tools (query_sql, query_influxdb) registered even under --disable-write. They pass the query through unfiltered, so they can mutate data if the datasource credentials permit it; use this when those credentials are known to be read-only. Has no effect if --disable-query is also set. Equivalent to --enable-write-tools=query_sql,query_influxdb; kept as a shorthand for that common case.")
 	flag.StringVar(&dt.writeToolOverrides, "enable-write-tools", "", "Comma separated list of individual tool names to keep registered even under --disable-write, for tools whose write behavior is scoped enough to opt back in independently. Has no effect on a tool whose whole category is disabled.")
@@ -709,7 +713,10 @@ const minSSEKeepAlive = time.Second
 // client; 0 disables them. run() passes a non-zero value only for the SSE
 // transport (see effectiveSSEKeepAlive).
 func newServer(serverName string, dt disabledTools, obs *observability.Observability, usage *usagestats.Reporter, instructionsAppend string, keepAlive time.Duration) *mcp.Server {
-	instructions := appendInstructions(dt.buildInstructions(), instructionsAppend)
+	instructions := ""
+	if !dt.instructions {
+		instructions = appendInstructions(dt.buildInstructions(), instructionsAppend)
+	}
 
 	s := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: mcpgrafana.Version()}, &mcp.ServerOptions{
 		Instructions:              instructions,
