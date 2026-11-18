@@ -261,6 +261,22 @@ func TestBuildInstructions_ReflectsEnabledCategories(t *testing.T) {
 			},
 		},
 		{
+			name:         "write categories reflect read-only mode",
+			enabledTools: "search,incident,dashboard,folder,oncall,annotations,snapshot,api",
+			disableFlags: map[string]bool{"write": true},
+			wantContains: []string{
+				"Incidents: Search incidents and fetch",
+				"Dashboards: Retrieve dashboards and list their versions.",
+				"OnCall: View on-call schedules",
+				"Annotations: Fetch dashboard annotations",
+				"Snapshots: List and get dashboard snapshots.",
+				"API: Make GET requests",
+			},
+			wantNotContains: []string{
+				"Folders:",
+			},
+		},
+		{
 			name:         "assistant excluded when write disabled",
 			enabledTools: "search,assistant",
 			disableFlags: map[string]bool{"write": true},

@@ -125,6 +125,19 @@ var categoryDescriptionNoQuery = map[string]string{
 	"graphite":     "Graphite: List Graphite metrics and tags. Query execution is disabled.",
 }
 
+// categoryDescriptionNoWrite replaces the description of a category whose
+// write tools --disable-write removes, so the agent is not told it can create
+// or change what it cannot.
+var categoryDescriptionNoWrite = map[string]string{
+	"incident":    "Incidents: Search incidents and fetch their details and custom fields in Grafana Incident.",
+	"dashboard":   "Dashboards: Retrieve dashboards and list their versions. Extract panel queries and datasource information.",
+	"oncall":      "OnCall: View on-call schedules, shifts, teams, users, and alert groups.",
+	"annotations": "Annotations: Fetch dashboard annotations and their tags.",
+	"snapshot":    "Snapshots: List and get dashboard snapshots.",
+	"api":         "API: Make GET requests to any Grafana API endpoint with optional jq-style response filtering.",
+	"agento11y":   "Agent Observability: Search and inspect LLM conversations, generations, and evaluation scores from Grafana Agent Observability. Read its agent catalog (system prompts, tools, version history, and per-version scores), its eval configuration (evaluators, templates, eval rules, and guards), its curated saved conversations and collections, its offline experiments with their trials and scores, and the versioned test suites those experiments run against.",
+}
+
 const navigationDescriptionNoShortening = "Navigation: Generate deeplink URLs for Grafana resources like dashboards, panels, and Explore queries."
 
 var queryOnlyCategories = []string{"elasticsearch", "quickwit", "influxdb", "runpanelquery", "tempo"}
@@ -554,8 +567,9 @@ func (dt *disabledTools) categoryRegistersTools(e toolEntry, enabledTools []stri
 	if !isCategoryEnabled(enabledTools, e.disabled, e.category) {
 		return false
 	}
-	// AddAssistantTools registers nothing when write tools are disabled.
-	if e.category == "assistant" && dt.write {
+	// AddAssistantTools and AddFolderTools register nothing when write tools
+	// are disabled.
+	if (e.category == "assistant" || e.category == "folder") && dt.write {
 		return false
 	}
 	// A category whose every tool executes a query registers nothing once
@@ -637,6 +651,12 @@ func (dt *disabledTools) buildInstructions() string {
 		// reduced capability rather than the full one.
 		if !dt.queryToolsEnabled(e.category) {
 			if desc, ok := categoryDescriptionNoQuery[e.category]; ok {
+				capabilities = append(capabilities, desc)
+				continue
+			}
+		}
+		if dt.write {
+			if desc, ok := categoryDescriptionNoWrite[e.category]; ok {
 				capabilities = append(capabilities, desc)
 				continue
 			}
