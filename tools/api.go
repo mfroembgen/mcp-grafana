@@ -94,6 +94,9 @@ func doAPIRequest(ctx context.Context, endpoint, method, body string, headers ma
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("grafana URL is not configured")
 	}
+	if cfg.FixedCallerIdentity && len(headers) > 0 {
+		return nil, fmt.Errorf("headers are not allowed: this server sends every request with its own Grafana identity")
+	}
 
 	method = strings.ToUpper(method)
 	if method == "" {

@@ -104,6 +104,17 @@ func TestAPIRequest_CustomHeaders(t *testing.T) {
 	assert.Equal(t, "custom-value", capturedHeaders.Get("X-Custom-Header"))
 }
 
+func TestAPIRequest_FixedCallerIdentityRejectsHeaders(t *testing.T) {
+	ctx := mcpgrafana.WithGrafanaConfig(context.Background(), mcpgrafana.GrafanaConfig{
+		URL: "http://grafana.invalid", FixedCallerIdentity: true,
+	})
+	_, err := apiRequestReadOnlyGetOnly(ctx, APIRequestReadOnlyGetOnlyParams{
+		Endpoint: "/api/org",
+		Headers:  map[string]string{"X-Grafana-Org-Id": "2"},
+	})
+	require.ErrorContains(t, err, "headers are not allowed")
+}
+
 func TestAPIRequest_JQFilter(t *testing.T) {
 	payload := map[string]any{
 		"dashboards": []any{

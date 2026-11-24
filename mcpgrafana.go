@@ -300,6 +300,10 @@ type GrafanaConfig struct {
 	// AllowCrossOriginRedirects permits HTTP redirects to a different origin.
 	// It disables the default redirect guard for clients built with BuildTransport.
 	AllowCrossOriginRedirects bool
+	// FixedCallerIdentity keeps callers on the configured Grafana identity:
+	// grafana_api_request rejects caller-supplied headers. WorkOS caller
+	// authentication sets it.
+	FixedCallerIdentity bool
 
 	// APIKey is the API key or service account token for the Grafana instance.
 	// It may be empty if we are using on-behalf-of auth.

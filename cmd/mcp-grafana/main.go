@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
@@ -710,6 +711,9 @@ type callerAuthConfig struct {
 	requireUserCredentials bool
 	userIdentityHeaders    string
 	logToolCalls           bool
+	workosAuthkit          string
+	workosResource         string
+	workosEmailDomain      string
 }
 
 func (ca *callerAuthConfig) addFlags() {
@@ -718,6 +722,9 @@ func (ca *callerAuthConfig) addFlags() {
 	flag.BoolVar(&ca.requireUserCredentials, "require-user-credentials", false, "Per-user mode for streamable-http: every call must carry its own Grafana credential (X-Grafana-Service-Account-Token, basic auth, or a forwarded Authorization, Cookie or --user-identity-headers header) or it is rejected with 401, and the server refuses to start if a shared credential is configured (GRAFANA_SERVICE_ACCOUNT_TOKEN, GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE, GRAFANA_API_KEY, GRAFANA_USERNAME, GRAFANA_PASSWORD, a credential or forwarded header in GRAFANA_EXTRA_HEADERS, userinfo in GRAFANA_URL, or --tls-cert-file/--tls-key-file). Falls back to "+requireUserCredentialsEnvVar+".")
 	flag.StringVar(&ca.userIdentityHeaders, "user-identity-headers", "", "Comma-separated forwarded headers that identify the Grafana user in --require-user-credentials mode, such as the auth proxy header X-WEBAUTH-USER. Each must also be in GRAFANA_FORWARD_HEADERS. Authorization and Cookie always count. Falls back to "+userIdentityHeadersEnvVar+".")
 	flag.BoolVar(&ca.logToolCalls, "log-tool-calls", false, "Log one info line per tool call with the caller's Grafana user (from /api/user, cached per credential for 5m), tool name, datasource UID, result, identity_status and duration. Tool arguments are never logged. Falls back to "+logToolCallsEnvVar+".")
+	flag.StringVar(&ca.workosAuthkit, "workos-authkit-domain", "", "HTTPS AuthKit origin for native WorkOS Connect authentication (streamable-http only)")
+	flag.StringVar(&ca.workosResource, "workos-resource-url", "", "Exact public HTTPS MCP endpoint URL configured as a WorkOS Resource Indicator")
+	flag.StringVar(&ca.workosEmailDomain, "workos-allowed-email-domain", "", "Exact domain whose verified WorkOS users may access the configured Grafana")
 }
 
 // applyEnv fills the boolean options from their environment variables when
@@ -773,6 +780,57 @@ func addToolCallLog(s *mcp.Server, ca callerAuthConfig) {
 	if ca.logToolCalls {
 		s.AddReceivingMiddleware(mcpgrafana.ToolCallLogMiddleware(slog.Default()))
 	}
+}
+
+// workOSServiceAccountCredentials are the shared Grafana credentials WorkOS
+// mode accepts: tokens of one service account in one organization.
+var workOSServiceAccountCredentials = []string{"GRAFANA_SERVICE_ACCOUNT_TOKEN", "GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE", "GRAFANA_API_KEY"}
+
+func (ca callerAuthConfig) workOS(transport, endpoint string, gc mcpgrafana.GrafanaConfig) (*mcpgrafana.WorkOSAuth, error) {
+	if ca.workosAuthkit == "" && ca.workosResource == "" && ca.workosEmailDomain == "" {
+		return nil, nil
+	}
+	if ca.workosAuthkit == "" || ca.workosResource == "" || ca.workosEmailDomain == "" {
+		return nil, fmt.Errorf("all three --workos-* authentication flags are required together")
+	}
+	if transport != "streamable-http" {
+		return nil, fmt.Errorf("WorkOS authentication requires --transport=streamable-http")
+	}
+	if ca.resolveToken() != "" {
+		return nil, fmt.Errorf("WorkOS authentication cannot be combined with --server-auth-token or %s", serverAuthTokenEnvVar)
+	}
+	if ca.requireUserCredentials {
+		// WorkOS strips caller credentials, so per-user mode would reject every call.
+		return nil, fmt.Errorf("WorkOS authentication cannot be combined with --require-user-credentials or %s", requireUserCredentialsEnvVar)
+	}
+	if gc.AllowGrafanaURLOverride || len(gc.AllowedGrafanaURLs) > 0 || gc.AllowCrossOriginRedirects || mcpgrafana.DynamicMultiOrgEnabled {
+		return nil, fmt.Errorf("WorkOS authentication requires one fixed Grafana target and organization")
+	}
+	// A service account token belongs to one organization. A user identity
+	// can belong to several, and ?orgId= on any request switches the shared
+	// user's active organization for every caller.
+	credentials := mcpgrafana.SharedCredentialsFromEnv(nil)
+	for _, credential := range credentials {
+		if !slices.Contains(workOSServiceAccountCredentials, credential) {
+			return nil, fmt.Errorf("WorkOS authentication requires a Grafana service account token, not %s", credential)
+		}
+	}
+	if len(credentials) == 0 {
+		return nil, fmt.Errorf("WorkOS authentication requires a Grafana service account token")
+	}
+	// Grafana's auth proxy trusts a configurable header name, so any extra
+	// header could select a user identity, as can a client certificate.
+	if os.Getenv("GRAFANA_EXTRA_HEADERS") != "" {
+		return nil, fmt.Errorf("WorkOS authentication cannot send GRAFANA_EXTRA_HEADERS to Grafana")
+	}
+	if gc.TLSConfig != nil && (gc.TLSConfig.CertFile != "" || gc.TLSConfig.KeyFile != "") {
+		return nil, fmt.Errorf("WorkOS authentication cannot send a client certificate to Grafana")
+	}
+	u, err := url.Parse(ca.workosResource)
+	if err != nil || u.Path != endpoint {
+		return nil, fmt.Errorf("workos-resource-url path must match the configured MCP endpoint")
+	}
+	return mcpgrafana.NewWorkOSAuth(ca.workosAuthkit, ca.workosResource, ca.workosEmailDomain)
 }
 
 func (ca callerAuthConfig) resolveToken() string {
@@ -1327,6 +1385,11 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 	if err := ca.validateUserMode(transport, gc.TLSConfig); err != nil {
 		return err
 	}
+	workosAuth, err := ca.workOS(transport, streamableEndpointPath(basePath, endpointPath), gc)
+	if err != nil {
+		return err
+	}
+	gc.FixedCallerIdentity = workosAuth != nil
 
 	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
 	slog.SetDefault(slog.New(stderrHandler))
@@ -1417,7 +1480,11 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 	}()
 
 	if transport == "sse" || transport == "streamable-http" {
-		checkCallerAuthPolicy(transport, addr, callerToken, slog.Default())
+		if workosAuth != nil {
+			slog.Info("WorkOS caller authentication enabled", "transport", transport)
+		} else {
+			checkCallerAuthPolicy(transport, addr, callerToken, slog.Default())
+		}
 		mcpgrafana.WarnIfOrgIDUnset(slog.Default())
 		if gc.AllowGrafanaURLOverride && len(gc.AllowedGrafanaURLs) == 0 {
 			slog.Error("SECURITY: unrestricted Grafana URL overrides are enabled. Every MCP caller can make requests to arbitrary HTTP(S) targets reachable by this server, including internal services. Use an authenticating proxy that authorizes targets and supplies matching tokens, and restrict outbound network access. An allowlist alone is not a substitute for these controls.")
@@ -1532,12 +1599,18 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 			// Inside caller auth, which strips the caller token header first.
 			mcpHandler = mcpgrafana.RequireUserCredentials(splitAndTrim(ca.userIdentityHeaders), slog.Default())(mcpHandler)
 		}
+		if workosAuth != nil {
+			mcpHandler = workosAuth.Middleware(mcpHandler)
+		}
 		mux := newStreamableHTTPMux(
 			mcpHandler,
 			mcpEndpoint,
 			caller,
 			hsc.corsOrigins(),
 		)
+		if workosAuth != nil {
+			workosAuth.RegisterRoutes(mux)
+		}
 		runOpsServers(registerOps(mux, o, healthzAddress, obs))
 
 		httpSrv := &http.Server{
