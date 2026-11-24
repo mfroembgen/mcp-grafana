@@ -33,6 +33,7 @@ You can look up defaults, choose `--disable-*` flags, or configure TLS without r
 - `--sse-keepalive`: Interval between ping requests the server sends to each SSE client, so a reverse proxy or load balancer doesn't close an idle event stream and end the session. Set it below the proxy's idle timeout, for example, `30s` behind ingress-nginx's default 60-second `proxy-read-timeout`. A client is disconnected after 3 pings in a row go unanswered for half the interval each. Accepts Go duration strings, minimum `1s`. Default: `0` (disabled). Applies only to `--transport sse`.
 - `--server-name`: Server name used in the MCP handshake and OTel `service.name`. Default: `mcp-grafana`. Overrides the `GRAFANA_MCP_SERVER_NAME` environment variable.
 - `--instructions-append`: Text appended to the server instructions returned to MCP clients on initialize, so every connecting agent sees it.
+- `--disable-instructions`: Send no server instructions, including `--instructions-append`, for example from all but one of several servers that the same agent connects.
 
 When `--address` uses port `0`, the operating system allocates a free port and the server atomically writes the bound address to `mcp-grafana-address` in its working directory. The file contains the address followed by a newline and is created with mode `0600`.
 
